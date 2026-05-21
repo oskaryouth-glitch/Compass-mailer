@@ -6,6 +6,7 @@ const { google } = require('googleapis');
 const path = require('path');
 
 const db = require('./db');
+const market = require('./marketRates');
 
 const app = express();
 app.use(express.json());
@@ -223,7 +224,26 @@ async function fetchAndPersist(client) {
     monthlyAppreciation = Math.round((v.price - purchase) / monthsHeld);
   }
 
-  const enriched = { ...v, history, monthlyAppreciation, monthsHeld };
+  // Layer in market intel: mortgage rate context + SF-metro annualized return.
+  // These run in parallel and degrade gracefully if FRED is down.
+  const [rateContext, marketReturn] = await Promise.all([
+    market.getRateContext(purchaseDate, purchase, v.price),
+    market.getMarketReturn(purchaseDate),
+  ]);
+
+  // Annualized return on THEIR home (so we can compare to the market)
+  let homeAnnualized = null;
+  if (purchase && monthsHeld) {
+    const years = monthsHeld / 12;
+    if (years > 0 && purchase > 0) {
+      homeAnnualized = Math.pow(v.price / purchase, 1 / years) - 1;
+    }
+  }
+
+  const enriched = {
+    ...v, history, monthlyAppreciation, monthsHeld,
+    rateContext, marketReturn, homeAnnualized,
+  };
 
   // Render the actual email HTML so the dashboard preview matches what gets sent
   const profile = await db.getState('gmail_profile');
@@ -317,6 +337,39 @@ function buildEmail(client, valData, senderName) {
     </div>
 
     ${purchaseHtml}
+
+    ${valData.rateContext ? `
+    <div style="background:#fff8e1;border:1px solid #f0e2b8;border-radius:8px;padding:14px 16px;margin-bottom:20px">
+      <div style="font-size:11px;font-weight:700;color:#8a6d1f;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px">Your rate lock</div>
+      <table style="width:100%;border-collapse:collapse;font-size:13px">
+        <tr><td style="padding:3px 0;color:#666">30-year fixed when you bought</td>
+            <td style="padding:3px 0;text-align:right;font-weight:600">${valData.rateContext.rateAtPurchase.toFixed(2)}%</td></tr>
+        <tr><td style="padding:3px 0;color:#666">30-year fixed today</td>
+            <td style="padding:3px 0;text-align:right;font-weight:600">${valData.rateContext.rateToday.toFixed(2)}%</td></tr>
+        ${valData.rateContext.lockedMonthly && valData.rateContext.buyerMonthly ? `
+        <tr><td style="padding:3px 0;color:#666">Buyer purchasing today (80% down) pays</td>
+            <td style="padding:3px 0;text-align:right;font-weight:600">$${valData.rateContext.buyerMonthly.toLocaleString()}/mo</td></tr>
+        <tr><td style="padding:3px 0;color:#666">You're estimated to pay</td>
+            <td style="padding:3px 0;text-align:right;font-weight:600">$${valData.rateContext.lockedMonthly.toLocaleString()}/mo</td></tr>
+        ${valData.rateContext.advantage && valData.rateContext.advantage > 0 ? `
+        <tr><td style="padding:6px 0 0;color:#1a1a1a;font-weight:600;border-top:1px solid #f0e2b8">Your rate-lock advantage</td>
+            <td style="padding:6px 0 0;text-align:right;font-weight:700;color:#2d7a3a;border-top:1px solid #f0e2b8">~$${valData.rateContext.advantage.toLocaleString()}/mo</td></tr>` : ''}
+        ` : ''}
+      </table>
+    </div>` : ''}
+
+    ${(valData.homeAnnualized != null && valData.marketReturn) ? `
+    <div style="background:#eef5fa;border:1px solid #d2e2ee;border-radius:8px;padding:14px 16px;margin-bottom:24px">
+      <div style="font-size:11px;font-weight:700;color:#1a4a7a;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px">Your home vs the SF market</div>
+      <table style="width:100%;border-collapse:collapse;font-size:13px">
+        <tr><td style="padding:3px 0;color:#666">Your home, annualized return</td>
+            <td style="padding:3px 0;text-align:right;font-weight:700;color:${valData.homeAnnualized >= 0 ? '#2d7a3a' : '#c0392b'}">${(valData.homeAnnualized*100).toFixed(1)}%/yr</td></tr>
+        <tr><td style="padding:3px 0;color:#666">SF metro average (Case-Shiller)</td>
+            <td style="padding:3px 0;text-align:right;font-weight:600">${(valData.marketReturn.annualized*100).toFixed(1)}%/yr</td></tr>
+        <tr><td style="padding:6px 0 0;color:#1a1a1a;font-weight:600;border-top:1px solid #d2e2ee">${(valData.homeAnnualized - valData.marketReturn.annualized) >= 0 ? 'Outperforming the market by' : 'Underperforming the market by'}</td>
+            <td style="padding:6px 0 0;text-align:right;font-weight:700;color:${(valData.homeAnnualized - valData.marketReturn.annualized) >= 0 ? '#2d7a3a' : '#c0392b'};border-top:1px solid #d2e2ee">${(valData.homeAnnualized - valData.marketReturn.annualized) >= 0 ? '+' : ''}${((valData.homeAnnualized - valData.marketReturn.annualized)*100).toFixed(1)} pp/yr</td></tr>
+      </table>
+    </div>` : ''}
 
     ${compsHtml ? `
     <p style="font-size:13px;font-weight:600;margin:0 0 8px;text-transform:uppercase;letter-spacing:.05em;color:#888">Currently for sale nearby</p>
