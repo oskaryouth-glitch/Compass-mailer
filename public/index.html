@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Compass Estimate Mailer</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f5f4f0;color:#1a1a1a;min-height:100vh}
+  .topbar{background:#1a1a1a;color:#fff;padding:0 28px;height:52px;display:flex;align-items:center;justify-content:space-between}
+  .topbar-logo{font-size:16px;font-weight:700;letter-spacing:-.3px}
+  .topbar-right{display:flex;align-items:center;gap:16px;font-size:13px}
+  .tag{padding:3px 10px;border-radius:100px;font-size:11px;font-weight:600}
+  .tag-ok{background:#2d7a3a;color:#fff}
+  .tag-err{background:#c0392b;color:#fff}
+  .tag-idle{background:#555;color:#fff}
+  .connect-btn{background:#fff;color:#1a1a1a;border:none;padding:5px 14px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;text-decoration:none}
+  .layout{display:flex;height:calc(100vh - 52px)}
+  .sidebar{width:280px;min-width:280px;background:#fff;border-right:1px solid #e8e6e0;display:flex;flex-direction:column;overflow:hidden}
+  .sidebar-head{padding:20px 20px 14px;border-bottom:1px solid #e8e6e0}
+  .sidebar-head h2{font-size:15px;font-weight:600;margin-bottom:14px}
+  .api-row{display:flex;flex-direction:column;gap:6px}
+  .api-row label{font-size:11px;font-weight:600;color:#888;text-transform:uppercase;letter-spacing:.05em}
+  .api-row input{width:100%;padding:7px 10px;border:1px solid #ddd;border-radius:6px;font-size:12px;font-family:monospace;background:#fafafa}
+  .save-btn{margin-top:4px;padding:5px 12px;background:#1a1a1a;color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer}
+  .stats{display:flex;gap:8px;padding:14px 20px;border-bottom:1px solid #e8e6e0}
+  .stat{flex:1;background:#f5f4f0;border-radius:8px;padding:10px;text-align:center}
+  .stat-num{font-size:20px;font-weight:700}
+  .stat-label{font-size:10px;color:#888;margin-top:2px;text-transform:uppercase;letter-spacing:.04em}
+  .client-list{flex:1;overflow-y:auto}
+  .client-item{display:flex;align-items:center;gap:11px;padding:11px 20px;cursor:pointer;border-bottom:1px solid #f0ede8;transition:background .1s}
+  .client-item:hover{background:#fafaf8}
+  .client-item.active{background:#f0ede8;border-left:3px solid #1a1a1a}
+  .av{width:34px;height:34px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;flex-shrink:0}
+  .av-a{background:#dce8f5;color:#1a4a7a}
+  .av-b{background:#ddf0e8;color:#1a5c38}
+  .av-c{background:#fde8e0;color:#7a2a18}
+  .av-d{background:#ece8fd;color:#3a287a}
+  .av-e{background:#e8f5e0;color:#2a5c18}
+  .c-name{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .c-addr{font-size:11px;color:#888;margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .c-badge{font-size:10px;font-weight:600;padding:2px 7px;border-radius:100px;flex-shrink:0}
+  .b-sent{background:#ddf0e8;color:#1a5c38}
+  .b-pending{background:#fef3e0;color:#7a5018}
+  .b-live{background:#dce8f5;color:#1a4a7a}
+  .main{flex:1;display:flex;flex-direction:column;overflow:hidden}
+  .main-head{padding:20px 28px;border-bottom:1px solid #e8e6e0;background:#fff;display:flex;align-items:center;justify-content:space-between}
+  .main-head h1{font-size:18px;font-weight:700}
+  .main-head .addr{font-size:13px;color:#888;margin-top:2px}
+  .btn-row{display:flex;gap:8px}
+  .btn{padding:7px 16px;border-radius:7px;font-size:13px;font-weight:600;cursor:pointer;border:1px solid #ddd;background:#fff;color:#1a1a1a;transition:all .1s}
+  .btn:hover{background:#f5f4f0}
+  .btn:disabled{opacity:.4;cursor:not-allowed}
+  .btn-dark{background:#1a1a1a;color:#fff;border-color:#1a1a1a}
+  .btn-dark:hover{background:#333}
+  .main-body{flex:1;overflow-y:auto;padding:24px 28px;display:flex;gap:20px}
+  .left{flex:1;display:flex;flex-direction:column;gap:16px}
+  .right{width:300px;min-width:300px;display:flex;flex-direction:column;gap:14px}
+  .card{background:#fff;border:1px solid #e8e6e0;border-radius:12px;padding:18px 20px}
+  .card-title{font-size:11px;font-weight:700;color:#888;text-transform:uppercase;letter-spacing:.07em;margin-bottom:14px}
+  .val-big{font-size:36px;font-weight:800;letter-spacing:-1px;line-height:1}
+  .val-src{display:inline-block;font-size:10px;font-weight:700;padding:2px 7px;border-radius:100px;margin-left:10px;vertical-align:middle}
+  .src-live{background:#ddf0e8;color:#1a5c38}
+  .src-mock{background:#dce8f5;color:#1a4a7a}
+  .val-chg{font-size:13px;font-weight:600;margin-top:8px;padding:3px 10px;border-radius:100px;display:inline-flex;align-items:center;gap:4px}
+  .chg-up{background:#ddf0e8;color:#1a5c38}
+  .chg-dn{background:#fde8e0;color:#7a2a18}
+  .detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .detail-item label{font-size:11px;color:#888;display:block;margin-bottom:3px}
+  .detail-item span{font-size:14px;font-weight:600}
+  svg.spark{width:100%;height:56px;margin-top:10px}
+  .comps{display:flex;flex-direction:column;gap:8px}
+  .comp{display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:#f8f7f4;border-radius:8px;font-size:12px}
+  .comp-a{color:#666;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-right:10px}
+  .comp-v{font-weight:700}
+  .comp-d{font-size:10px;color:#aaa;margin-left:6px}
+  .email-wrap{background:#f8f7f4;border-radius:12px;overflow:hidden;border:1px solid #e8e6e0}
+  .email-hdr{background:#fff;padding:12px 14px;border-bottom:1px solid #e8e6e0}
+  .email-from{font-size:10px;color:#aaa;margin-bottom:2px}
+  .email-subj{font-size:13px;font-weight:600}
+  .email-bd{padding:14px;font-size:12px;color:#555;line-height:1.65}
+  .email-val{font-size:24px;font-weight:800;text-align:center;background:#fff;border-radius:8px;padding:14px;margin:10px 0;border:1px solid #e8e6e0}
+  .email-val small{display:block;font-size:11px;color:#888;font-weight:400;margin-top:3px}
+  .footer-bar{padding:12px 28px;border-top:1px solid #e8e6e0;background:#fff;display:flex;align-items:center;justify-content:space-between}
+  .footer-bar span{font-size:13px;color:#888}
+  .toast{position:fixed;bottom:24px;right:24px;background:#1a1a1a;color:#fff;padding:12px 20px;border-radius:10px;font-size:13px;font-weight:600;opacity:0;transition:opacity .3s;pointer-events:none;z-index:99}
+  .toast.show{opacity:1}
+  .spinner{display:inline-block;width:13px;height:13px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle;margin-right:6px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .loading{opacity:.5;pointer-events:none}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <span class="topbar-logo">Compass · Estimate Mailer</span>
+  <div class="topbar-right">
+    <span id="gmail-tag" class="tag tag-idle">Gmail: checking…</span>
+    <span id="apify-tag" class="tag tag-idle">Apify: checking…</span>
+    <a href="/auth/connect" class="connect-btn" id="connect-btn" style="display:none">Connect Gmail →</a>
+    <span id="sender-label" style="font-size:12px;color:#aaa"></span>
+  </div>
+</div>
+
+<div class="layout">
+  <div class="sidebar">
+    <div class="sidebar-head">
+      <h2>Settings</h2>
+      <div style="font-size:12px;color:#666;line-height:1.5">
+        Apify token, Resend API key, and database URL are configured via environment variables. Edit your <code style="background:#f0ede8;padding:1px 4px;border-radius:3px;font-size:11px">.env</code> file (local) or your Vercel project settings (production).
+      </div>
+      <div id="sender-info" style="font-size:11px;color:#888;margin-top:10px"></div>
+    </div>
+    <div class="stats">
+      <div class="stat"><div class="stat-num" id="st-total">5</div><div class="stat-label">Clients</div></div>
+      <div class="stat"><div class="stat-num" id="st-sent">0</div><div class="stat-label">Sent</div></div>
+      <div class="stat"><div class="stat-num" id="st-live">0</div><div class="stat-label">Live</div></div>
+    </div>
+    <div class="client-list" id="client-list"></div>
+  </div>
+
+  <div class="main">
+    <div class="main-head">
+      <div>
+        <h1 id="h-name">Sarah & Tom Chen</h1>
+        <div class="addr" id="h-addr">271 Buena Vista Ave, Mill Valley, CA 94941</div>
+      </div>
+      <div class="btn-row">
+        <button class="btn" id="fetch-btn" onclick="fetchOne()">↻ Fetch estimate</button>
+        <button class="btn btn-dark" id="send-btn" onclick="sendOne()">Send email</button>
+      </div>
+    </div>
+
+    <div class="main-body">
+      <div class="left">
+        <div class="card">
+          <div class="card-title">Current estimate</div>
+          <div>
+            <span class="val-big" id="val-main">$3,842,000</span>
+            <span class="val-src src-mock" id="val-src">mock</span>
+          </div>
+          <div class="val-chg chg-up" id="val-chg">↑ +$44,000 past 30 days</div>
+          <svg class="spark" id="sparkline" viewBox="0 0 260 56" preserveAspectRatio="none"></svg>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Comparable sales <span id="comps-tag" style="font-weight:400;text-transform:none;letter-spacing:0;color:#aaa;font-size:10px">(sample)</span></div>
+          <div class="comps" id="comps-list">
+            <div class="comp"><span class="comp-a">Fetch live data to see real comps</span></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Property details</div>
+          <div class="detail-grid">
+            <div class="detail-item"><label>Purchase price</label><span id="d-purchase">—</span></div>
+            <div class="detail-item"><label>Purchase date</label><span id="d-date">—</span></div>
+            <div class="detail-item"><label>Sq ft</label><span id="d-sqft">—</span></div>
+            <div class="detail-item"><label>Beds / Baths</label><span id="d-beds">—</span></div>
+            <div class="detail-item"><label>Gain since purchase</label><span id="d-gain">—</span></div>
+            <div class="detail-item"><label>$/sqft</label><span id="d-sqftval">—</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="right">
+        <div class="card-title" style="padding:0 0 6px">Email preview</div>
+        <div class="email-wrap">
+          <div class="email-hdr">
+            <div class="email-from" id="e-from">From: Max · Compass</div>
+            <div class="email-subj" id="e-subj">Your home value — May 2026</div>
+          </div>
+          <div class="email-bd" id="e-body" style="padding:16px;background:#fff;max-height:560px;overflow:auto"></div>
+        </div>
+        <div id="preview-note" style="font-size:11px;color:#aaa;text-align:center;margin-top:4px">
+          Fetch the estimate to see the actual email that would be sent
+        </div>
+      </div>
+    </div>
+
+    <div class="footer-bar">
+      <span>🗓 Monthly send: 1st of each month, 9am · Auto-scheduler active</span>
+      <div style="display:flex;gap:8px">
+        <button class="btn" id="fetch-all-btn" onclick="fetchAll()">↻ Fetch all estimates</button>
+        <button class="btn btn-dark" onclick="sendAll()">Send all clients now</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+let clients = [];
+let selected = 0;
+let liveVals = {};
+
+function fmt(n){ return '$' + Math.round(n).toLocaleString(); }
+
+async function loadStatus(){
+  const r = await fetch('/api/status');
+  const d = await r.json();
+  clients = d.clients || [];
+
+  const gmailTag = document.getElementById('gmail-tag');
+  const connectBtn = document.getElementById('connect-btn');
+  if(d.gmailConnected){
+    gmailTag.className = 'tag tag-ok';
+    gmailTag.textContent = 'Gmail: ' + d.senderEmail;
+    connectBtn.style.display = 'none';
+  } else if(d.gmailConfigured){
+    gmailTag.className = 'tag tag-idle';
+    gmailTag.textContent = 'Gmail: not connected';
+    connectBtn.style.display = '';
+  } else {
+    gmailTag.className = 'tag tag-err';
+    gmailTag.textContent = 'Gmail: missing OAuth config';
+    connectBtn.style.display = 'none';
+  }
+
+  const apifyTag = document.getElementById('apify-tag');
+  apifyTag.className = 'tag ' + (d.apifyConfigured ? 'tag-ok' : 'tag-err');
+  apifyTag.textContent = d.apifyConfigured ? 'Apify: ready' : 'Apify: missing key';
+
+  if(d.senderEmail){
+    document.getElementById('sender-info').textContent = `Sends from: ${d.senderName} <${d.senderEmail}>`;
+  }
+
+  renderList();
+  renderSelected();
+  updateStats();
+}
+
+function updateStats(){
+  document.getElementById('st-total').textContent = clients.length;
+  document.getElementById('st-sent').textContent = clients.filter(c=>c.lastSent).length;
+  document.getElementById('st-live').textContent = Object.keys(liveVals).length;
+}
+
+function renderList(){
+  const avs=['av-a','av-b','av-c','av-d','av-e'];
+  document.getElementById('client-list').innerHTML = clients.map((c,i)=>{
+    const live = liveVals[c.id];
+    const badge = c.lastSent
+      ? '<span class="c-badge b-sent">Sent</span>'
+      : live
+        ? '<span class="c-badge b-live">Live</span>'
+        : '<span class="c-badge b-pending">Pending</span>';
+    return `<div class="client-item${i===selected?' active':''}" onclick="selectClient(${i})">
+      <div class="av ${avs[i%5]}">${c.name.split(' ').map(w=>w[0]).slice(0,2).join('')}</div>
+      <div style="flex:1;min-width:0">
+        <div class="c-name">${c.name}</div>
+        <div class="c-addr">${c.addr}</div>
+      </div>
+      ${badge}
+    </div>`;
+  }).join('');
+}
+
+function selectClient(i){
+  selected = i;
+  renderList();
+  renderSelected();
+}
+
+function renderSelected(){
+  const c = clients[selected];
+  if(!c) return;
+  const live = liveVals[c.id];
+  // Merge: live data overrides stored fields when present
+  const sqft     = (live && live.sqft)          ?? c.sqft;
+  const beds     = (live && live.beds  != null) ? live.beds  : c.beds;
+  const baths    = (live && live.baths != null) ? live.baths : c.baths;
+  const purchase = (live && live.purchasePrice) || c.purchase;
+  const purchaseDate = (live && live.purchaseDate) || c.purchaseDate;
+  const val      = live ? live.price : c.lastVal;
+  // Only compute change when we have BOTH a live value and a real prior.
+  // No more fake +1.1% gain from thin air.
+  const prev   = (live && c.lastVal && live.price !== c.lastVal) ? c.lastVal : null;
+  const change = (val != null && prev != null) ? val - prev : null;
+
+  document.getElementById('h-name').textContent = c.name;
+  document.getElementById('h-addr').textContent = `${c.addr}, ${c.city}, ${c.state} ${c.zip}`;
+  document.getElementById('val-main').textContent = val != null ? fmt(val) : '—';
+  document.getElementById('val-src').className = 'val-src ' + (live ? 'src-live' : 'src-mock');
+  document.getElementById('val-src').textContent = live ? 'zillow' : (val != null ? 'stored' : 'no data');
+
+  const chgEl = document.getElementById('val-chg');
+  if(change != null){
+    chgEl.className = 'val-chg ' + (change >= 0 ? 'chg-up' : 'chg-dn');
+    chgEl.textContent = (change >= 0 ? '↑ +' : '↓ ') + fmt(Math.abs(change)) + ' since last reading';
+    chgEl.style.display = '';
+  } else {
+    chgEl.className = 'val-chg';
+    chgEl.style.background = '#f0ede8';
+    chgEl.style.color = '#888';
+    chgEl.textContent = val != null ? 'First reading on record' : 'No data yet';
+  }
+
+  document.getElementById('d-purchase').textContent = purchase ? fmt(purchase) : '—';
+  document.getElementById('d-date').textContent     = purchaseDate
+    ? new Date(purchaseDate).toLocaleDateString('en-US',{month:'short',year:'numeric'}) : '—';
+  document.getElementById('d-sqft').textContent     = sqft  ? sqft.toLocaleString() : '—';
+  document.getElementById('d-beds').textContent     = (beds != null && baths != null) ? beds + ' / ' + baths : '—';
+
+  const gain = (val != null && purchase) ? val - purchase : null;
+  const gainEl = document.getElementById('d-gain');
+  gainEl.textContent = gain != null ? (gain >= 0 ? '+' : '') + fmt(gain) : '—';
+  gainEl.style.color = gain != null ? (gain >= 0 ? '#2d7a3a' : '#c0392b') : '#888';
+  document.getElementById('d-sqftval').textContent = (sqft && val) ? '$' + Math.round(val/sqft).toLocaleString() : '—';
+
+  // Comparables: only present when we have a live fetch
+  if(live && live.comparables && live.comparables.length){
+    document.getElementById('comps-tag').textContent = '(' + live.comparables.length + ' nearby on Zillow)';
+    document.getElementById('comps-list').innerHTML = live.comparables.map(comp => `
+      <div class="comp">
+        <span class="comp-a">${comp.address}</span>
+        <span class="comp-v">${fmt(comp.price)}</span>
+        <span class="comp-d">${comp.beds || '?'}bd · ${comp.sqft ? comp.sqft.toLocaleString() + ' sf' : '—'}</span>
+      </div>`).join('');
+  } else {
+    document.getElementById('comps-tag').textContent = '';
+    document.getElementById('comps-list').innerHTML = '<div class="comp"><span class="comp-a" style="color:#aaa">Fetch the estimate to load nearby comps</span></div>';
+  }
+
+  drawSpark(c, val, live);
+  updateEmailPreview(c, val, change, live);
+}
+
+// Real sparkline: anchored at the purchase date, then every recorded monthly
+// reading, ending at the current Zestimate. No fake noise.
+function drawSpark(c, val, live){
+  const points = [];
+  const purchaseDate = (live && live.purchaseDate) || c.purchaseDate;
+  const purchase     = (live && live.purchasePrice) || c.purchase;
+  if (purchaseDate && purchase) {
+    points.push({ t: new Date(purchaseDate).getTime(), v: purchase });
+  }
+  const history = (live && live.history) || c.history || [];
+  history.forEach(h => points.push({ t: new Date(h.recordedAt).getTime(), v: h.value }));
+  // Ensure the current Zestimate is the rightmost point even if history is empty
+  if (val != null) {
+    if (!points.length || points[points.length-1].v !== val) {
+      points.push({ t: Date.now(), v: val });
+    }
+  }
+
+  const svg = document.getElementById('sparkline');
+  if (points.length < 2) {
+    svg.innerHTML = '<text x="130" y="32" text-anchor="middle" font-size="10" fill="#bbb">need more readings to plot trend</text>';
+    return;
+  }
+  const W = 260, H = 56, pad = 4;
+  const tMin = points[0].t, tMax = points[points.length-1].t;
+  const vMin = Math.min(...points.map(p=>p.v)), vMax = Math.max(...points.map(p=>p.v));
+  const tRng = (tMax - tMin) || 1, vRng = (vMax - vMin) || 1;
+  const xy = p => [
+    pad + ((p.t - tMin) / tRng) * (W - pad*2),
+    H - pad - ((p.v - vMin) / vRng) * (H - pad*2),
+  ];
+  const coords = points.map(xy).map(([x,y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(' ');
+  const overall = points[points.length-1].v - points[0].v;
+  const col = overall >= 0 ? '#2d7a3a' : '#c0392b';
+  const dots = points.map(p => { const [x,y] = xy(p); return `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="2.5" fill="${col}"/>`; }).join('');
+  svg.innerHTML = `<polyline points="${coords}" fill="none" stroke="${col}" stroke-width="2" stroke-linejoin="round"/>${dots}`;
+}
+
+function updateEmailPreview(c, val, change, live){
+  const monthLabel = new Date().toLocaleDateString('en-US',{month:'long',year:'numeric'});
+  document.getElementById('e-subj').textContent = `Your ${c.addr} home value — ${monthLabel}`;
+  const note = document.getElementById('preview-note');
+  if (live && live.previewHtml) {
+    document.getElementById('e-body').innerHTML = live.previewHtml;
+    if (note) note.textContent = 'This is the exact email that will be sent.';
+  } else {
+    const firstName = c.name.split(' ')[0];
+    document.getElementById('e-body').innerHTML = `
+      <div style="padding:20px;color:#888;font-size:13px;line-height:1.6;text-align:center">
+        <div style="margin-bottom:8px">No estimate fetched yet for ${firstName}.</div>
+        <div>Click <strong>↻ Fetch estimate</strong> above to see the email preview.</div>
+      </div>`;
+    if (note) note.textContent = 'Fetch the estimate to see the actual email that would be sent';
+  }
+}
+
+async function fetchOne(){
+  const c = clients[selected];
+  const btn = document.getElementById('fetch-btn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Fetching...';
+  try {
+    const r = await fetch(`/api/estimate/${c.id}`,{method:'POST'});
+    const d = await r.json();
+    if(d.error) throw new Error(d.error);
+    liveVals[c.id] = d;
+    renderSelected();
+    updateStats();
+    renderList();
+    toast('Live estimate loaded ✓');
+  } catch(e){
+    toast('Error: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '↻ Fetch estimate';
+  }
+}
+
+async function sendOne(){
+  const c = clients[selected];
+  const btn = document.getElementById('send-btn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Sending...';
+  try {
+    const r = await fetch(`/api/send/${c.id}`,{method:'POST'});
+    const d = await r.json();
+    if(d.error) throw new Error(d.error);
+    c.lastSent = new Date().toISOString();
+    c.lastVal = d.val;
+    renderList();
+    updateStats();
+    toast(`Email sent to ${c.name} ✓`);
+  } catch(e){
+    toast('Error: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = 'Send email';
+  }
+}
+
+async function fetchAll(){
+  const btn = document.getElementById('fetch-all-btn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Fetching all…';
+  try {
+    const r = await fetch('/api/fetch-all', { method: 'POST' });
+    const d = await r.json();
+    if(d.error) throw new Error(d.error);
+    let ok = 0, fail = 0;
+    d.results.forEach(res => {
+      if(res.ok){ liveVals[res.id] = res.data; ok++; } else { fail++; }
+    });
+    // Refresh client list from server to pick up backfilled sqft/beds/etc.
+    await loadStatus();
+    toast(`${ok} fetched${fail ? ', ' + fail + ' failed' : ' ✓'}`);
+  } catch(e){
+    toast('Error: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '↻ Fetch all estimates';
+  }
+}
+
+async function sendAll(){
+  const btn = event.target;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Sending all...';
+  try {
+    const r = await fetch('/api/send-all',{method:'POST'});
+    const d = await r.json();
+    if(d.error) throw new Error(d.error);
+    const ok = d.results.filter(x=>x.ok).length;
+    const fail = d.results.filter(x=>!x.ok).length;
+    d.results.forEach(res => {
+      const c = clients.find(x=>x.id===res.id);
+      if(c && res.ok){ c.lastSent = new Date().toISOString(); c.lastVal = res.val; }
+    });
+    renderList();
+    updateStats();
+    toast(`${ok} sent${fail?', '+fail+' failed':' ✓'}`);
+  } catch(e){
+    toast('Error: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = 'Send all clients now';
+  }
+}
+
+function toast(msg){
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  setTimeout(()=>el.classList.remove('show'), 3000);
+}
+
+if(location.search.includes('connected=gmail')) toast('Gmail connected ✓');
+loadStatus();
+</script>
+</body>
+</html>

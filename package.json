@@ -1,0 +1,20 @@
+{
+  "name": "compass-mailer",
+  "version": "1.0.0",
+  "description": "Monthly home estimate mailer for Compass agents",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "^1.1.0",
+    "axios": "^1.6.0",
+    "dotenv": "^17.4.2",
+    "express": "^4.18.2",
+    "googleapis": "^172.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.0"
+  }
+}
