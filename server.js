@@ -7,6 +7,54 @@ const path = require('path');
 
 const db = require('./db');
 const market = require('./marketRates');
+const zipActivity = require('./zipActivity');
+
+// Mine listing description text for appraiser-relevant features that may not
+// appear in Zillow's structured fields (Curtis's outdoor space is a good example).
+function extractDescriptionFeatures(desc) {
+  if (!desc || typeof desc !== 'string') return [];
+  const t = desc.toLowerCase();
+  const found = [];
+  // Views
+  if (/golden gate|bridge view/.test(t))             found.push('Golden Gate Bridge view');
+  else if (/bay view|water view/.test(t))            found.push('Water/Bay view');
+  else if (/city view|panoramic|skyline/.test(t))    found.push('Panoramic/city view');
+  // Outdoor space
+  if (/\bgarden(s)?\b/.test(t))                      found.push('Garden(s)');
+  if (/\bpatio\b/.test(t))                           found.push('Patio');
+  if (/\bdeck\b/.test(t))                            found.push('Deck');
+  if (/\b(roof[ -]?deck|rooftop)\b/.test(t))         found.push('Roof deck');
+  if (/\bbalcony\b/.test(t))                         found.push('Balcony');
+  if (/\bterrace\b/.test(t))                         found.push('Terrace');
+  if (/\b(back|front)[ -]?yard\b/.test(t))           found.push('Yard');
+  if (/\bcourtyard\b/.test(t))                       found.push('Courtyard');
+  // Condition / quality
+  if (/turn[ -]?key|move[ -]in (ready|condition)/.test(t)) found.push('Turn-key');
+  if (/\brenovat(ed|ion)|remodel(ed|led)?/.test(t))  found.push('Recently renovated');
+  if (/\bhigh[ -]?end\b/.test(t))                    found.push('High-end finishes');
+  return [...new Set(found)];
+}
+
+// Compare unit-suffix patterns: if subject has no APT/Unit suffix but most
+// comps do, subject is likely in a smaller (boutique) building, which usually
+// commands a 5-20% premium that median-$/sqft from comps does NOT capture.
+function detectBoutiquePremium(subjectAddr, comps) {
+  const hasUnit = a => /\b(apt|unit|#|suite|ste)\b/i.test(a || '') || /\bAPT\s+/.test(a || '');
+  const subjHasUnit = hasUnit(subjectAddr);
+  if (subjHasUnit) return null; // subject is in a multi-unit building — not boutique
+  const compsCount = comps?.length || 0;
+  if (compsCount < 2) return null;
+  const compsWithUnit = comps.filter(c => hasUnit(c.address)).length;
+  const ratio = compsWithUnit / compsCount;
+  if (ratio >= 0.4) {
+    return {
+      compsInLargerBuildings: compsWithUnit,
+      totalComps: compsCount,
+      note: `Subject is in a smaller building; ${compsWithUnit} of ${compsCount} comps are in larger multi-unit buildings. Boutique buildings typically command a 5-20% per-sqft premium not reflected in the median comp $/sqft.`,
+    };
+  }
+  return null;
+}
 
 const app = express();
 app.use(express.json());
@@ -225,6 +273,12 @@ async function fetchEstimate(client) {
   const comparables = pickComparables(p.nearbyHomes, subject);
   const appraisal   = computeAppraisalEstimate(subject, comparables);
 
+  // Premium factors not captured in the median-$/sqft math
+  const descriptionFeatures = extractDescriptionFeatures(p.description);
+  const boutiquePremium     = (p.homeType === 'CONDO' || p.homeType === 'APARTMENT')
+    ? detectBoutiquePremium(p.streetAddress || client.addr, comparables)
+    : null;
+
   return {
     price: val,
     source: 'zillow_zestimate',
@@ -239,9 +293,14 @@ async function fetchEstimate(client) {
     purchasePrice,
     purchaseDate,
     zillowUrl:      p.hdpUrl ? 'https://www.zillow.com' + p.hdpUrl : null,
+    zipcode:        p.zipcode || client.zip,
+    lat:            p.latitude,
+    lng:            p.longitude,
     appraiserFacts,
     comparables,
     appraisal,
+    descriptionFeatures,
+    boutiquePremium,
   };
 }
 
@@ -285,11 +344,13 @@ async function fetchAndPersist(client) {
     monthlyAppreciation = Math.round((v.price - purchase) / monthsHeld);
   }
 
-  // Layer in market intel: mortgage rate context + SF-metro annualized return.
-  // These run in parallel and degrade gracefully if FRED is down.
-  const [rateContext, marketReturn] = await Promise.all([
+  // Layer in market intel: mortgage rate context, SF-metro annualized return,
+  // and zip-level transaction activity. All run in parallel and degrade
+  // gracefully if any external source fails.
+  const [rateContext, marketReturn, zipStats] = await Promise.all([
     market.getRateContext(purchaseDate, purchase, v.price),
     market.getMarketReturn(purchaseDate),
+    zipActivity.getZipActivity(APIFY_TOKEN, v.lat, v.lng, v.zipcode),
   ]);
 
   // Annualized return on THEIR home (so we can compare to the market)
@@ -304,6 +365,7 @@ async function fetchAndPersist(client) {
   const enriched = {
     ...v, history, monthlyAppreciation, monthsHeld,
     rateContext, marketReturn, homeAnnualized,
+    zipStats,
   };
 
   // Render the actual email HTML so the dashboard preview matches what gets sent
@@ -420,6 +482,11 @@ function buildEmail(client, valData, senderName) {
 
     ${purchaseHtml}
 
+    ${valData.boutiquePremium ? `
+    <div style="background:#fef3e0;border:1px solid #ead9b6;border-radius:8px;padding:10px 14px;margin-bottom:16px;font-size:12px;color:#6a4f1a">
+      <strong>Heads up:</strong> ${valData.boutiquePremium.note}
+    </div>` : ''}
+
     ${valData.appraisal && valData.appraisal.compsUsed?.length >= 3 ? `
     <div style="background:#f3f0e8;border:1px solid #e1d9c4;border-radius:8px;padding:14px 16px;margin-bottom:20px">
       <div style="font-size:11px;font-weight:700;color:#5a4a1f;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px">Compass appraisal estimate</div>
@@ -445,6 +512,9 @@ function buildEmail(client, valData, senderName) {
       if (af.numberOfUnitsInCommunity)facts.push(`<strong>Building:</strong> ${af.numberOfUnitsInCommunity} units total`);
       if (af.yearBuiltEffective && af.yearBuiltEffective !== valData.yearBuilt) facts.push(`<strong>Effective year built:</strong> ${af.yearBuiltEffective} (last major renovation)`);
       if (af.propertyCondition)       facts.push(`<strong>Condition:</strong> ${af.propertyCondition}`);
+      // Pull mined description features (e.g., "Golden Gate Bridge view, Gardens, High-end finishes")
+      const descFacts = valData.descriptionFeatures || [];
+      if (descFacts.length)           facts.push(`<strong>Highlights from listing:</strong> ${descFacts.join(', ')}`);
       return facts.length ? `
       <p style="font-size:12px;color:#666;line-height:1.6;margin:0 0 20px;padding:10px 14px;background:#fafaf8;border-radius:6px">
         <span style="font-size:11px;font-weight:700;color:#888;text-transform:uppercase;letter-spacing:.06em;display:block;margin-bottom:4px">About your home</span>
@@ -482,6 +552,29 @@ function buildEmail(client, valData, senderName) {
             <td style="padding:3px 0;text-align:right;font-weight:600">${(valData.marketReturn.annualized*100).toFixed(1)}%/yr</td></tr>
         <tr><td style="padding:6px 0 0;color:#1a1a1a;font-weight:600;border-top:1px solid #d2e2ee">${(valData.homeAnnualized - valData.marketReturn.annualized) >= 0 ? 'Outperforming the market by' : 'Underperforming the market by'}</td>
             <td style="padding:6px 0 0;text-align:right;font-weight:700;color:${(valData.homeAnnualized - valData.marketReturn.annualized) >= 0 ? '#2d7a3a' : '#c0392b'};border-top:1px solid #d2e2ee">${(valData.homeAnnualized - valData.marketReturn.annualized) >= 0 ? '+' : ''}${((valData.homeAnnualized - valData.marketReturn.annualized)*100).toFixed(1)} pp/yr</td></tr>
+      </table>
+    </div>` : ''}
+
+    ${valData.zipStats && (valData.zipStats.currentMonth > 0 || valData.zipStats.yearAgoMonth > 0) ? `
+    <div style="background:#f0f4ed;border:1px solid #d1ddc3;border-radius:8px;padding:14px 16px;margin-bottom:20px">
+      <div style="font-size:11px;font-weight:700;color:#3b5a1f;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px">${valData.zipStats.zipcode} sales activity</div>
+      <table style="width:100%;border-collapse:collapse;font-size:13px">
+        <tr><td style="padding:3px 0;color:#666">Homes sold in last 30 days</td>
+            <td style="padding:3px 0;text-align:right;font-weight:700">${valData.zipStats.currentMonth}</td></tr>
+        ${valData.zipStats.yearAgoMonth > 0 ? `
+        <tr><td style="padding:3px 0;color:#666">Same month last year</td>
+            <td style="padding:3px 0;text-align:right;font-weight:600">${valData.zipStats.yearAgoMonth}</td></tr>
+        ${(() => {
+          const delta = valData.zipStats.currentMonth - valData.zipStats.yearAgoMonth;
+          const pct = valData.zipStats.yearAgoMonth ? ((delta / valData.zipStats.yearAgoMonth) * 100) : 0;
+          const color = delta >= 0 ? '#2d7a3a' : '#c0392b';
+          return `<tr><td style="padding:6px 0 0;color:#1a1a1a;font-weight:600;border-top:1px solid #d1ddc3">Year over year</td>
+                  <td style="padding:6px 0 0;text-align:right;font-weight:700;color:${color};border-top:1px solid #d1ddc3">${delta >= 0 ? '+' : ''}${delta} sales (${pct >= 0 ? '+' : ''}${pct.toFixed(0)}%)</td></tr>`;
+        })()}
+        ` : ''}
+        ${valData.zipStats.medianPrice ? `
+        <tr><td style="padding:3px 0;color:#666;font-size:12px">Median sale price this month</td>
+            <td style="padding:3px 0;text-align:right;font-weight:500;font-size:12px">$${valData.zipStats.medianPrice.toLocaleString()}</td></tr>` : ''}
       </table>
     </div>` : ''}
 
