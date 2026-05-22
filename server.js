@@ -79,57 +79,90 @@ async function getGmailAuth() {
 // the body of fetchEstimate() with the MLS actor call and keep the return
 // shape identical. Nothing else in the app needs to change.
 
-async function fetchComparables(lat, lng, homeType, refSqft, streetWord) {
-  if (lat == null || lng == null) return [];
-  const delta = 0.012; // ~0.75 mi box
-  const sqs = {
-    isMapVisible: true,
-    isListVisible: true,
-    mapBounds: { north: lat+delta, south: lat-delta, east: lng+delta, west: lng-delta },
-    filterState: { sort: { value: 'days' } },
+// Convert a raw nearbyHome entry from the detail scraper into our comp shape.
+function normalizeNearbyHome(n) {
+  const addr = n.address?.streetAddress || n.address || null;
+  return {
+    address:    addr,
+    price:      n.price || n.zestimate || null,
+    beds:       n.bedrooms ?? null,
+    baths:      n.bathrooms ?? null,
+    sqft:       n.livingArea ?? null,
+    lotSize:    n.lotSize ?? null,
+    homeType:   n.homeType ?? null,
+    homeStatus: n.homeStatus ?? null,
+    lat:        n.latitude,
+    lng:        n.longitude,
+    zpid:       n.zpid,
+    detailUrl:  n.hdpUrl ? 'https://www.zillow.com' + n.hdpUrl : null,
   };
-  const url = `https://www.zillow.com/homes/for_sale/?searchQueryState=${encodeURIComponent(JSON.stringify(sqs))}`;
-  try {
-    const res = await axios.post(
-      `https://api.apify.com/v2/acts/maxcopell~zillow-scraper/run-sync-get-dataset-items?token=${APIFY_TOKEN}&timeout=120`,
-      { searchUrls: [{ url }], extractionMethod: 'MAP_MARKERS' },
-      { headers: { 'Content-Type': 'application/json' }, timeout: 130000 }
-    );
-    const raw = Array.isArray(res.data) ? res.data : [];
-    const comps = raw.map(p => {
-      const hi = (p.hdpData && p.hdpData.homeInfo) || {};
-      return {
-        address:  p.address || hi.streetAddress,
-        price:    hi.zestimate || hi.price || null,
-        beds:     hi.bedrooms ?? null,
-        baths:    hi.bathrooms ?? null,
-        sqft:     hi.livingArea ?? null,
-        homeType: hi.homeType ?? null,
-        lat:      hi.latitude  ?? p.latLong?.latitude,
-        lng:      hi.longitude ?? p.latLong?.longitude,
-      };
-    }).filter(c => c.address && c.price);
+}
 
-    // Filter to similar properties so we don't mix condos with mansions
-    const matchesType = c => !homeType || !c.homeType || c.homeType === homeType;
-    const matchesSize = c => {
-      if (!refSqft) return true;
-      // When we know our home's sqft, reject comps with missing/zero sqft data
-      if (!c.sqft || c.sqft <= 0) return false;
-      return c.sqft >= refSqft * 0.5 && c.sqft <= refSqft * 1.7;
+// Pick the best comparables for sales-comparison valuation:
+// (a) same home type, (b) sqft within 50%-150% of subject, (c) prefer same
+// street/building, then closest by geo distance.
+function pickComparables(nearbyHomes, subject) {
+  if (!Array.isArray(nearbyHomes) || !nearbyHomes.length) return [];
+
+  const comps = nearbyHomes.map(normalizeNearbyHome).filter(c => c.address && c.price && c.sqft > 0);
+  const subType  = subject.homeType;
+  const subSqft  = subject.sqft;
+  const subLat   = subject.lat;
+  const subLng   = subject.lng;
+  // Use street's first significant word, e.g., "Chestnut" or "Vallejo"
+  const streetWord = (subject.streetAddr || '').replace(/^\d+\s+/, '').split(/\s+/)[0].toLowerCase();
+
+  const matchesType = c => !subType || !c.homeType || c.homeType === subType;
+  const matchesSize = c => !subSqft || (c.sqft >= subSqft * 0.5 && c.sqft <= subSqft * 1.5);
+  const sameStreet  = c => streetWord && (c.address || '').toLowerCase().includes(streetWord);
+  const distance    = c => (subLat != null && c.lat != null) ? Math.hypot(c.lat - subLat, c.lng - subLng) : Infinity;
+
+  return comps
+    .filter(c => matchesType(c) && matchesSize(c))
+    .sort((a, b) => (sameStreet(b) - sameStreet(a)) || (distance(a) - distance(b)))
+    .slice(0, 6);
+}
+
+// Appraiser-style sales-comparison valuation (USPAP-flavored).
+// For each comp: comp's price → normalize to $/sqft. Adjust comp $/sqft for
+// bed/bath count differences vs subject (small adjustments). Reconcile by
+// median to avoid outlier sensitivity. Multiply by subject sqft.
+function computeAppraisalEstimate(subject, comps) {
+  if (!subject.sqft || !comps?.length) return null;
+
+  // Per-bed / per-bath adjustments are conservative & relative (10% of unit ppsf)
+  const adjusted = comps.map(c => {
+    const cPpsf = c.price / c.sqft;
+    const bedDelta  = ((subject.beds  ?? 0) - (c.beds  ?? 0));
+    const bathDelta = ((subject.baths ?? 0) - (c.baths ?? 0));
+    // Each extra bed/bath worth ~5% of the comp's $/sqft, capped at +/-20%
+    const adjPct = Math.max(-0.20, Math.min(0.20, bedDelta * 0.04 + bathDelta * 0.03));
+    return {
+      ...c,
+      ppsf: cPpsf,
+      adjustedPpsf: cPpsf * (1 + adjPct),
+      adjPct,
     };
-    const sameStreet  = c => streetWord && (c.address || '').toLowerCase().includes(streetWord);
-    const dist = c => Math.hypot((c.lat||lat)-lat, (c.lng||lng)-lng);
+  });
 
-    const filtered = comps.filter(c => matchesType(c) && matchesSize(c));
-    // Prefer same-street, then closest
-    return filtered
-      .sort((a, b) => (sameStreet(b) - sameStreet(a)) || (dist(a) - dist(b)))
-      .slice(0, 3);
-  } catch (e) {
-    console.error('[comps] failed:', e.message);
-    return [];
-  }
+  // Median adjusted $/sqft (robust to outliers like a single mega-luxury comp)
+  const sorted = [...adjusted].sort((a, b) => a.adjustedPpsf - b.adjustedPpsf);
+  const mid = Math.floor(sorted.length / 2);
+  const medianPpsf = sorted.length % 2 === 1
+    ? sorted[mid].adjustedPpsf
+    : (sorted[mid-1].adjustedPpsf + sorted[mid].adjustedPpsf) / 2;
+
+  const estimate = Math.round(medianPpsf * subject.sqft);
+  const low      = Math.round(sorted[0].adjustedPpsf * subject.sqft);
+  const high     = Math.round(sorted[sorted.length-1].adjustedPpsf * subject.sqft);
+
+  return {
+    estimate,
+    low,
+    high,
+    medianPpsf: Math.round(medianPpsf),
+    compsUsed:  adjusted,
+  };
 }
 
 async function fetchEstimate(client) {
@@ -162,9 +195,35 @@ async function fetchEstimate(client) {
     purchaseDate  = new Date(p.dateSold).toISOString().slice(0, 10);
   }
 
-  // Comparables (separate actor call, parallel-safe)
-  const streetWord  = (client.addr.replace(/^\d+\s+/, '').split(/\s+/)[0] || '').toLowerCase();
-  const comparables = await fetchComparables(p.latitude, p.longitude, p.homeType, p.livingArea, streetWord);
+  // Pull appraiser-relevant facts (view, parking, condition) from resoFacts
+  const rf = p.resoFacts || {};
+  const appraiserFacts = {
+    view:                rf.view?.length ? rf.view : null,
+    hasView:             rf.hasView || !!rf.waterViewYN,
+    hasWaterfrontView:   !!rf.hasWaterfrontView,
+    parkingCapacity:     rf.parkingCapacity ?? null,
+    hasGarage:           rf.hasGarage ?? null,
+    parkingFeatures:     rf.parkingFeatures?.length ? rf.parkingFeatures : null,
+    patioAndPorch:       rf.patioAndPorchFeatures?.length ? rf.patioAndPorchFeatures : null,
+    lotFeatures:         rf.lotFeatures?.length ? rf.lotFeatures : null,
+    exteriorFeatures:    rf.exteriorFeatures?.length ? rf.exteriorFeatures : null,
+    yearBuiltEffective:  rf.yearBuiltEffective ?? null,
+    propertyCondition:   rf.propertyCondition ?? null,
+    storiesTotal:        rf.storiesTotal ?? null,
+    numberOfUnitsInCommunity: rf.numberOfUnitsInCommunity ?? null,
+    buildingName:        rf.buildingName ?? null,
+    associationFee:      rf.associationFee ?? p.monthlyHoaFee ?? null,
+  };
+
+  // Appraiser-style comparables come from nearbyHomes (Zillow's curated
+  // list of same-building/same-street properties), not a separate search.
+  const subject = {
+    addr: client.addr, streetAddr: p.streetAddress,
+    homeType: p.homeType, sqft: p.livingArea, beds: p.bedrooms, baths: p.bathrooms,
+    lat: p.latitude, lng: p.longitude,
+  };
+  const comparables = pickComparables(p.nearbyHomes, subject);
+  const appraisal   = computeAppraisalEstimate(subject, comparables);
 
   return {
     price: val,
@@ -180,7 +239,9 @@ async function fetchEstimate(client) {
     purchasePrice,
     purchaseDate,
     zillowUrl:      p.hdpUrl ? 'https://www.zillow.com' + p.hdpUrl : null,
+    appraiserFacts,
     comparables,
+    appraisal,
   };
 }
 
@@ -288,10 +349,31 @@ function buildEmail(client, valData, senderName) {
   const firstName = client.name.split(' ')[0];
   const market    = marketName(client.city);
 
-  const compsHtml = (valData.comparables || []).slice(0, 3).map(c => `
-    <tr>
-      <td style="padding:6px 0;color:#555;font-size:13px">${c.address}</td>
-      <td style="padding:6px 0;text-align:right;font-weight:600;font-size:13px">$${Math.round(c.price || 0).toLocaleString()}</td>
+  function statusLabel(s) {
+    if (s === 'FOR_SALE')      return 'For sale';
+    if (s === 'SOLD')          return 'Recently sold';
+    if (s === 'PENDING')       return 'Pending';
+    return 'Off market'; // OTHER or unknown
+  }
+  function statusColor(s) {
+    if (s === 'FOR_SALE')      return '#1a4a7a';
+    if (s === 'SOLD')          return '#5a4a1f';
+    if (s === 'PENDING')       return '#7a5018';
+    return '#999';
+  }
+  const compsHtml = (valData.comparables || []).slice(0, 4).map(c => `
+    <tr style="border-bottom:1px solid #f4f1ec">
+      <td style="padding:8px 0;font-size:13px">
+        <div style="font-weight:600;color:#1a1a1a">${c.address}</div>
+        <div style="font-size:11px;color:#888;margin-top:1px">
+          ${c.beds ?? '?'}bd · ${c.baths ?? '?'}ba · ${c.sqft ? c.sqft.toLocaleString() + ' sf' : 'sqft —'}
+          &nbsp;·&nbsp; <span style="color:${statusColor(c.homeStatus)};font-weight:600">${statusLabel(c.homeStatus)}</span>
+        </div>
+      </td>
+      <td style="padding:8px 0;text-align:right;font-weight:700;font-size:13px;vertical-align:top">
+        $${Math.round(c.price || 0).toLocaleString()}
+        ${c.sqft ? `<div style="font-size:10px;color:#aaa;font-weight:400;margin-top:1px">$${Math.round(c.price/c.sqft).toLocaleString()}/sf</div>` : ''}
+      </td>
     </tr>`).join('');
 
   // Purchase-gain block: only if we know what they paid
@@ -338,6 +420,38 @@ function buildEmail(client, valData, senderName) {
 
     ${purchaseHtml}
 
+    ${valData.appraisal && valData.appraisal.compsUsed?.length >= 3 ? `
+    <div style="background:#f3f0e8;border:1px solid #e1d9c4;border-radius:8px;padding:14px 16px;margin-bottom:20px">
+      <div style="font-size:11px;font-weight:700;color:#5a4a1f;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px">Compass appraisal estimate</div>
+      <div style="font-size:13px;color:#666;margin-bottom:8px">Based on ${valData.appraisal.compsUsed.length} same-${valData.homeType === 'CONDO' ? 'building or same-street condo' : 'street single-family'} ${valData.appraisal.compsUsed.length === 1 ? 'comp' : 'comps'}, applying $/sqft and bed/bath adjustments (USPAP sales-comparison method):</div>
+      <table style="width:100%;border-collapse:collapse;font-size:13px">
+        <tr><td style="padding:3px 0;color:#666">Median $/sqft from comps</td>
+            <td style="padding:3px 0;text-align:right;font-weight:600">$${valData.appraisal.medianPpsf.toLocaleString()}/sqft</td></tr>
+        <tr><td style="padding:3px 0;color:#666">Adjusted range across comps</td>
+            <td style="padding:3px 0;text-align:right;font-weight:600">$${valData.appraisal.low.toLocaleString()} – $${valData.appraisal.high.toLocaleString()}</td></tr>
+        <tr><td style="padding:6px 0 0;color:#1a1a1a;font-weight:600;border-top:1px solid #e1d9c4">Our estimate</td>
+            <td style="padding:6px 0 0;text-align:right;font-weight:700;color:#1a1a1a;border-top:1px solid #e1d9c4">$${valData.appraisal.estimate.toLocaleString()}</td></tr>
+        <tr><td style="padding:3px 0;color:#888;font-size:12px">Zillow Zestimate for comparison</td>
+            <td style="padding:3px 0;text-align:right;font-weight:500;color:#888;font-size:12px">$${val.toLocaleString()}</td></tr>
+      </table>
+    </div>` : ''}
+
+    ${(() => {
+      const af = valData.appraiserFacts || {};
+      const facts = [];
+      if (af.view?.length)            facts.push(`<strong>View:</strong> ${af.view.join(', ')}`);
+      if (af.parkingCapacity > 0)     facts.push(`<strong>Parking:</strong> ${af.parkingCapacity} ${af.hasGarage ? 'garage' : 'spaces'}`);
+      if (af.patioAndPorch?.length)   facts.push(`<strong>Outdoor:</strong> ${af.patioAndPorch.join(', ')}`);
+      if (af.numberOfUnitsInCommunity)facts.push(`<strong>Building:</strong> ${af.numberOfUnitsInCommunity} units total`);
+      if (af.yearBuiltEffective && af.yearBuiltEffective !== valData.yearBuilt) facts.push(`<strong>Effective year built:</strong> ${af.yearBuiltEffective} (last major renovation)`);
+      if (af.propertyCondition)       facts.push(`<strong>Condition:</strong> ${af.propertyCondition}`);
+      return facts.length ? `
+      <p style="font-size:12px;color:#666;line-height:1.6;margin:0 0 20px;padding:10px 14px;background:#fafaf8;border-radius:6px">
+        <span style="font-size:11px;font-weight:700;color:#888;text-transform:uppercase;letter-spacing:.06em;display:block;margin-bottom:4px">About your home</span>
+        ${facts.join(' &nbsp;·&nbsp; ')}
+      </p>` : '';
+    })()}
+
     ${valData.rateContext ? `
     <div style="background:#fff8e1;border:1px solid #f0e2b8;border-radius:8px;padding:14px 16px;margin-bottom:20px">
       <div style="font-size:11px;font-weight:700;color:#8a6d1f;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px">Your rate lock</div>
@@ -372,7 +486,7 @@ function buildEmail(client, valData, senderName) {
     </div>` : ''}
 
     ${compsHtml ? `
-    <p style="font-size:13px;font-weight:600;margin:0 0 8px;text-transform:uppercase;letter-spacing:.05em;color:#888">Currently for sale nearby</p>
+    <p style="font-size:13px;font-weight:600;margin:0 0 8px;text-transform:uppercase;letter-spacing:.05em;color:#888">Comparable properties on your street</p>
     <table style="width:100%;border-collapse:collapse;margin-bottom:24px;border-top:1px solid #eee">
       ${compsHtml}
     </table>` : ''}
