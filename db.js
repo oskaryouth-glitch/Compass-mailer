@@ -10,7 +10,8 @@ async function listClients() {
   return await sql`
     SELECT id, name, email, addr, city, state, zip, sqft, beds, baths,
            purchase, purchase_date AS "purchaseDate",
-           last_sent AS "lastSent", last_val AS "lastVal"
+           last_sent AS "lastSent", last_val AS "lastVal",
+           COALESCE(manual_comps, '[]'::jsonb) AS "manualComps"
     FROM clients
     ORDER BY id
   `;
@@ -20,11 +21,16 @@ async function getClient(id) {
   const rows = await sql`
     SELECT id, name, email, addr, city, state, zip, sqft, beds, baths,
            purchase, purchase_date AS "purchaseDate",
-           last_sent AS "lastSent", last_val AS "lastVal"
+           last_sent AS "lastSent", last_val AS "lastVal",
+           COALESCE(manual_comps, '[]'::jsonb) AS "manualComps"
     FROM clients
     WHERE id = ${id}
   `;
   return rows[0] || null;
+}
+
+async function setManualComps(clientId, comps) {
+  await sql`UPDATE clients SET manual_comps = ${JSON.stringify(comps)}::jsonb WHERE id = ${clientId}`;
 }
 
 async function recordSend(id, lastVal) {
@@ -123,5 +129,5 @@ async function setState(key, value) {
 
 module.exports = {
   sql, listClients, getClient, recordSend, upsertClient, deleteClient, replaceAllClients,
-  getState, setState, patchClient, recordHistory, getHistory,
+  getState, setState, patchClient, recordHistory, getHistory, setManualComps,
 };

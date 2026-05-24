@@ -522,26 +522,6 @@ function buildEmail(client, valData, senderName) {
       </p>` : '';
     })()}
 
-    ${valData.rateContext ? `
-    <div style="background:#fff8e1;border:1px solid #f0e2b8;border-radius:8px;padding:14px 16px;margin-bottom:20px">
-      <div style="font-size:11px;font-weight:700;color:#8a6d1f;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px">Your rate lock</div>
-      <table style="width:100%;border-collapse:collapse;font-size:13px">
-        <tr><td style="padding:3px 0;color:#666">30-year fixed when you bought</td>
-            <td style="padding:3px 0;text-align:right;font-weight:600">${valData.rateContext.rateAtPurchase.toFixed(2)}%</td></tr>
-        <tr><td style="padding:3px 0;color:#666">30-year fixed today</td>
-            <td style="padding:3px 0;text-align:right;font-weight:600">${valData.rateContext.rateToday.toFixed(2)}%</td></tr>
-        ${valData.rateContext.lockedMonthly && valData.rateContext.buyerMonthly ? `
-        <tr><td style="padding:3px 0;color:#666">Buyer purchasing today (80% down) pays</td>
-            <td style="padding:3px 0;text-align:right;font-weight:600">$${valData.rateContext.buyerMonthly.toLocaleString()}/mo</td></tr>
-        <tr><td style="padding:3px 0;color:#666">You're estimated to pay</td>
-            <td style="padding:3px 0;text-align:right;font-weight:600">$${valData.rateContext.lockedMonthly.toLocaleString()}/mo</td></tr>
-        ${valData.rateContext.advantage && valData.rateContext.advantage > 0 ? `
-        <tr><td style="padding:6px 0 0;color:#1a1a1a;font-weight:600;border-top:1px solid #f0e2b8">Your rate-lock advantage</td>
-            <td style="padding:6px 0 0;text-align:right;font-weight:700;color:#2d7a3a;border-top:1px solid #f0e2b8">~$${valData.rateContext.advantage.toLocaleString()}/mo</td></tr>` : ''}
-        ` : ''}
-      </table>
-    </div>` : ''}
-
     ${(valData.homeAnnualized != null && valData.marketReturn) ? `
     <div style="background:#eef5fa;border:1px solid #d2e2ee;border-radius:8px;padding:14px 16px;margin-bottom:24px">
       <div style="font-size:11px;font-weight:700;color:#1a4a7a;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px">Your home vs the SF market</div>
@@ -553,6 +533,7 @@ function buildEmail(client, valData, senderName) {
         <tr><td style="padding:6px 0 0;color:#1a1a1a;font-weight:600;border-top:1px solid #d2e2ee">${(valData.homeAnnualized - valData.marketReturn.annualized) >= 0 ? 'Outperforming the market by' : 'Underperforming the market by'}</td>
             <td style="padding:6px 0 0;text-align:right;font-weight:700;color:${(valData.homeAnnualized - valData.marketReturn.annualized) >= 0 ? '#2d7a3a' : '#c0392b'};border-top:1px solid #d2e2ee">${(valData.homeAnnualized - valData.marketReturn.annualized) >= 0 ? '+' : ''}${((valData.homeAnnualized - valData.marketReturn.annualized)*100).toFixed(1)} pp/yr</td></tr>
       </table>
+      <div style="font-size:10px;color:#8aa3b8;margin-top:8px;line-height:1.4">Source: FRED Case-Shiller San Francisco Home Price Index (SFXRSA), monthly through ${valData.marketReturn.indexDate}. Metro-wide index, may not capture luxury-segment heat.</div>
     </div>` : ''}
 
     ${valData.zipStats && (valData.zipStats.currentMonth > 0 || valData.zipStats.yearAgoMonth > 0) ? `
@@ -578,6 +559,27 @@ function buildEmail(client, valData, senderName) {
       </table>
     </div>` : ''}
 
+    ${(client.manualComps && client.manualComps.length) ? `
+    <p style="font-size:13px;font-weight:600;margin:0 0 8px;text-transform:uppercase;letter-spacing:.05em;color:#5a4a1f">Off-market sales I've seen</p>
+    <div style="font-size:11px;color:#888;margin-bottom:8px;font-style:italic">From my private intel, not on Zillow or the public MLS:</div>
+    <table style="width:100%;border-collapse:collapse;margin-bottom:24px;border-top:1px solid #e1d9c4;background:#fdfaf0">
+      ${client.manualComps.map(c => `
+      <tr style="border-bottom:1px solid #f0e9d4">
+        <td style="padding:8px 6px;font-size:13px">
+          <div style="font-weight:600;color:#1a1a1a">${c.address}</div>
+          <div style="font-size:11px;color:#888;margin-top:1px">
+            ${c.beds != null ? c.beds + 'bd · ' : ''}${c.baths != null ? c.baths + 'ba · ' : ''}${c.sqft ? c.sqft.toLocaleString() + ' sf' : ''}
+            ${c.soldDate ? ' &nbsp;·&nbsp; sold ' + new Date(c.soldDate).toLocaleDateString('en-US',{month:'short',year:'numeric'}) : ''}
+          </div>
+          ${c.note ? `<div style="font-size:11px;color:#5a4a1f;margin-top:2px;font-style:italic">${c.note}</div>` : ''}
+        </td>
+        <td style="padding:8px 6px;text-align:right;font-weight:700;font-size:13px;vertical-align:top">
+          $${Math.round(c.price).toLocaleString()}
+          ${c.sqft ? `<div style="font-size:10px;color:#aaa;font-weight:400;margin-top:1px">$${Math.round(c.price/c.sqft).toLocaleString()}/sf</div>` : ''}
+        </td>
+      </tr>`).join('')}
+    </table>` : ''}
+
     ${compsHtml ? `
     <p style="font-size:13px;font-weight:600;margin:0 0 8px;text-transform:uppercase;letter-spacing:.05em;color:#888">Comparable properties on your street</p>
     <table style="width:100%;border-collapse:collapse;margin-bottom:24px;border-top:1px solid #eee">
@@ -586,10 +588,10 @@ function buildEmail(client, valData, senderName) {
 
     ${gain != null && valData.monthlyAppreciation != null ? `
     <p style="font-size:14px;line-height:1.7;margin:0 0 16px;color:#444">
-      Since you bought ${client.addr}${purchaseDate ? ' in ' + new Date(purchaseDate).toLocaleDateString('en-US',{month:'long',year:'numeric'}) : ''}, it's ${gain >= 0 ? 'appreciated' : 'softened'} <strong style="color:${gain >= 0 ? '#2d7a3a' : '#c0392b'}">${gain >= 0 ? '+' : '−'}$${Math.abs(gain).toLocaleString()}</strong>, averaging about <strong>${valData.monthlyAppreciation >= 0 ? '+' : '−'}$${Math.abs(valData.monthlyAppreciation).toLocaleString()}/month</strong>. ${gain >= 0 ? "That's compounding equity working in your favor." : "The market has cooled in your segment, but long-term Bay Area fundamentals remain strong. Worth a conversation if you're weighing options."}
+      Since you bought ${client.addr}${purchaseDate ? ' in ' + new Date(purchaseDate).toLocaleDateString('en-US',{month:'long',year:'numeric'}) : ''}, it's ${gain >= 0 ? 'appreciated' : 'softened'} <strong style="color:${gain >= 0 ? '#2d7a3a' : '#c0392b'}">${gain >= 0 ? '+' : '−'}$${Math.abs(gain).toLocaleString()}</strong>, averaging about <strong>${valData.monthlyAppreciation >= 0 ? '+' : '−'}$${Math.abs(valData.monthlyAppreciation).toLocaleString()}/month</strong>.
     </p>` : ''}
     <p style="font-size:14px;line-height:1.7;margin:0 0 24px;color:#444">
-      The ${market} market continues to favor sellers, with limited inventory and steady Bay Area demand. Thinking about selling, refinancing, or just curious how the neighborhood is shifting? Reply anytime, I'm always happy to chat.
+      Thinking about selling, refinancing, or just curious about the ${market} market right now? Reply anytime, I'm always happy to chat.
     </p>
 
     <div style="border-top:1px solid #eee;padding-top:16px;font-size:13px;color:#888">
@@ -718,6 +720,32 @@ app.post('/api/clients', async (req, res) => {
   try {
     await db.replaceAllClients(req.body.clients || []);
     res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Manual off-market comps — Max's expert intel that no scraper can find.
+// Body: { comps: [{ address, price, beds?, baths?, sqft?, soldDate?, note? }, ...] }
+app.put('/api/clients/:id/manual-comps', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const incoming = Array.isArray(req.body.comps) ? req.body.comps : [];
+    // Light validation: each must have at minimum an address and a price
+    const cleaned = incoming
+      .filter(c => c && c.address && c.price)
+      .map(c => ({
+        address:  String(c.address).trim(),
+        price:    Number(c.price),
+        beds:     c.beds  != null ? Number(c.beds)  : null,
+        baths:    c.baths != null ? Number(c.baths) : null,
+        sqft:     c.sqft  != null ? Number(c.sqft)  : null,
+        soldDate: c.soldDate || null,
+        note:     c.note ? String(c.note).trim().slice(0, 200) : null,
+      }))
+      .slice(0, 10); // cap at 10 per client
+    await db.setManualComps(id, cleaned);
+    res.json({ ok: true, comps: cleaned });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

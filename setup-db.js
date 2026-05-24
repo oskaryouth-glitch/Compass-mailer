@@ -44,6 +44,9 @@ const seedClients = [
       created_at    timestamptz DEFAULT now()
     )
   `;
+  // Idempotent column add for upgrade installs
+  await sql`ALTER TABLE clients ADD COLUMN IF NOT EXISTS manual_comps jsonb DEFAULT '[]'::jsonb`;
+
   await sql`
     CREATE TABLE IF NOT EXISTS value_history (
       id          serial PRIMARY KEY,

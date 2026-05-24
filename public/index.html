@@ -161,6 +161,25 @@
             <div class="detail-item"><label>$/sqft</label><span id="d-sqftval">—</span></div>
           </div>
         </div>
+
+        <div class="card" style="background:#fdfaf0;border-color:#e1d9c4">
+          <div class="card-title" style="color:#5a4a1f">Off-market sales I know about</div>
+          <div style="font-size:11px;color:#888;margin-bottom:10px;line-height:1.5">Pocket listings, private sales, comps your client should know about. Zillow can't see these. They'll render as <em>"Off-market sales I've seen"</em> in the email.</div>
+          <div id="manual-comps-list"></div>
+          <details style="margin-top:8px">
+            <summary style="font-size:12px;color:#5a4a1f;font-weight:600;cursor:pointer;padding:6px 0">+ Add an off-market comp</summary>
+            <div style="display:grid;grid-template-columns:2fr 1fr;gap:6px;margin-top:8px">
+              <input id="mc-addr"  placeholder="2850 Broadway, San Francisco, CA" style="padding:6px 8px;border:1px solid #ddd;border-radius:5px;font-size:12px;grid-column:1/-1" />
+              <input id="mc-price" type="number" placeholder="Price (e.g. 45000000)" style="padding:6px 8px;border:1px solid #ddd;border-radius:5px;font-size:12px" />
+              <input id="mc-date"  type="date" style="padding:6px 8px;border:1px solid #ddd;border-radius:5px;font-size:12px" />
+              <input id="mc-beds"  type="number" placeholder="Beds" style="padding:6px 8px;border:1px solid #ddd;border-radius:5px;font-size:12px" />
+              <input id="mc-baths" type="number" step="0.5" placeholder="Baths" style="padding:6px 8px;border:1px solid #ddd;border-radius:5px;font-size:12px" />
+              <input id="mc-sqft"  type="number" placeholder="Sqft" style="padding:6px 8px;border:1px solid #ddd;border-radius:5px;font-size:12px;grid-column:1/-1" />
+              <input id="mc-note"  placeholder="Note (optional, e.g. 'Pocket listing via Compass')" style="padding:6px 8px;border:1px solid #ddd;border-radius:5px;font-size:12px;grid-column:1/-1" />
+              <button onclick="addManualComp()" class="save-btn" style="grid-column:1/-1;margin-top:4px">Add comp</button>
+            </div>
+          </details>
+        </div>
       </div>
 
       <div class="right">
@@ -324,7 +343,83 @@ function renderSelected(){
   }
 
   drawSpark(c, val, live);
+  renderManualComps(c);
   updateEmailPreview(c, val, change, live);
+}
+
+function renderManualComps(c) {
+  const list = document.getElementById('manual-comps-list');
+  if (!list) return;
+  const comps = c.manualComps || [];
+  if (!comps.length) {
+    list.innerHTML = '<div style="font-size:12px;color:#aaa;text-align:center;padding:8px;background:#fff;border-radius:5px">None added yet</div>';
+    return;
+  }
+  list.innerHTML = comps.map((mc, i) => `
+    <div style="background:#fff;border:1px solid #e1d9c4;border-radius:6px;padding:8px 10px;margin-bottom:6px;display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+      <div style="flex:1;min-width:0;font-size:12px">
+        <div style="font-weight:600">${mc.address}</div>
+        <div style="color:#888;margin-top:1px">$${(mc.price||0).toLocaleString()}${mc.beds != null ? ' · ' + mc.beds + 'bd' : ''}${mc.baths != null ? '/' + mc.baths + 'ba' : ''}${mc.sqft ? ' · ' + mc.sqft.toLocaleString() + 'sf' : ''}${mc.soldDate ? ' · ' + mc.soldDate : ''}</div>
+        ${mc.note ? `<div style="color:#5a4a1f;font-style:italic;margin-top:2px">"${mc.note}"</div>` : ''}
+      </div>
+      <button onclick="removeManualComp(${i})" style="border:none;background:none;color:#c0392b;cursor:pointer;font-size:14px;padding:0 4px" title="Remove">×</button>
+    </div>`).join('');
+}
+
+async function saveManualComps(comps) {
+  const c = clients[selected];
+  const r = await fetch(`/api/clients/${c.id}/manual-comps`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ comps }),
+  });
+  const d = await r.json();
+  if (d.error) { toast('Error: ' + d.error); return false; }
+  // Reflect in local state immediately so user sees update without refetch
+  c.manualComps = d.comps;
+  renderManualComps(c);
+  renderSelected();
+  // If we already have a live estimate, refresh the preview HTML so the new
+  // comps appear in the email preview (server-side rendered)
+  if (liveVals[c.id]) {
+    try {
+      const r2 = await fetch(`/api/estimate/${c.id}`, { method: 'POST' });
+      const d2 = await r2.json();
+      if (!d2.error) {
+        liveVals[c.id] = d2;
+        renderSelected();
+      }
+    } catch (e) { /* silent — comp still saved */ }
+  }
+  return true;
+}
+
+async function addManualComp() {
+  const addr  = document.getElementById('mc-addr').value.trim();
+  const price = parseFloat(document.getElementById('mc-price').value);
+  if (!addr || !price) { toast('Address and price required'); return; }
+  const newComp = {
+    address: addr,
+    price,
+    beds:  document.getElementById('mc-beds').value  ? parseFloat(document.getElementById('mc-beds').value)  : null,
+    baths: document.getElementById('mc-baths').value ? parseFloat(document.getElementById('mc-baths').value) : null,
+    sqft:  document.getElementById('mc-sqft').value  ? parseInt(document.getElementById('mc-sqft').value)    : null,
+    soldDate: document.getElementById('mc-date').value || null,
+    note:  document.getElementById('mc-note').value.trim() || null,
+  };
+  const c = clients[selected];
+  const next = [...(c.manualComps || []), newComp];
+  if (await saveManualComps(next)) {
+    // Clear form
+    ['mc-addr','mc-price','mc-date','mc-beds','mc-baths','mc-sqft','mc-note'].forEach(id => document.getElementById(id).value = '');
+    toast('Off-market comp added ✓');
+  }
+}
+
+async function removeManualComp(idx) {
+  const c = clients[selected];
+  const next = (c.manualComps || []).filter((_, i) => i !== idx);
+  if (await saveManualComps(next)) toast('Removed ✓');
 }
 
 // Real sparkline: anchored at the purchase date, then every recorded monthly
