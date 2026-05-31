@@ -171,44 +171,65 @@ function pickComparables(nearbyHomes, subject) {
     .slice(0, 6);
 }
 
-// Appraiser-style sales-comparison valuation (USPAP-flavored).
-// For each comp: comp's price → normalize to $/sqft. Adjust comp $/sqft for
-// bed/bath count differences vs subject (small adjustments). Reconcile by
-// median to avoid outlier sensitivity. Multiply by subject sqft.
+// Appraiser-style sales-comparison valuation (USPAP-flavored), but also
+// honest about hot-market reality. We compute three views:
+//   1. "Paper" estimate — median adjusted $/sqft (USPAP standard, conservative)
+//   2. "Most similar comp" estimate — the single closest-by-sqft comp's $/sqft
+//      applied to the subject. Shows what the most directly relevant trade implies.
+//   3. Comp range — low and high adjusted values across all comps.
 function computeAppraisalEstimate(subject, comps) {
   if (!subject.sqft || !comps?.length) return null;
 
-  // Per-bed / per-bath adjustments are conservative & relative (10% of unit ppsf)
+  // Per-bed / per-bath adjustments are conservative & relative
   const adjusted = comps.map(c => {
+    if (!c.sqft || !c.price) return null;
     const cPpsf = c.price / c.sqft;
     const bedDelta  = ((subject.beds  ?? 0) - (c.beds  ?? 0));
     const bathDelta = ((subject.baths ?? 0) - (c.baths ?? 0));
-    // Each extra bed/bath worth ~5% of the comp's $/sqft, capped at +/-20%
     const adjPct = Math.max(-0.20, Math.min(0.20, bedDelta * 0.04 + bathDelta * 0.03));
+    const sizeDelta = Math.abs(c.sqft - subject.sqft) / subject.sqft;
     return {
       ...c,
       ppsf: cPpsf,
       adjustedPpsf: cPpsf * (1 + adjPct),
       adjPct,
+      sizeDelta,
     };
-  });
+  }).filter(Boolean);
 
-  // Median adjusted $/sqft (robust to outliers like a single mega-luxury comp)
-  const sorted = [...adjusted].sort((a, b) => a.adjustedPpsf - b.adjustedPpsf);
-  const mid = Math.floor(sorted.length / 2);
-  const medianPpsf = sorted.length % 2 === 1
-    ? sorted[mid].adjustedPpsf
-    : (sorted[mid-1].adjustedPpsf + sorted[mid].adjustedPpsf) / 2;
+  if (!adjusted.length) return null;
 
-  const estimate = Math.round(medianPpsf * subject.sqft);
-  const low      = Math.round(sorted[0].adjustedPpsf * subject.sqft);
-  const high     = Math.round(sorted[sorted.length-1].adjustedPpsf * subject.sqft);
+  // Median adjusted $/sqft (conservative paper number)
+  const sortedByPpsf = [...adjusted].sort((a, b) => a.adjustedPpsf - b.adjustedPpsf);
+  const mid = Math.floor(sortedByPpsf.length / 2);
+  const medianPpsf = sortedByPpsf.length % 2 === 1
+    ? sortedByPpsf[mid].adjustedPpsf
+    : (sortedByPpsf[mid-1].adjustedPpsf + sortedByPpsf[mid].adjustedPpsf) / 2;
+
+  // Most-similar comp by sqft distance (the single most-defensible single reference)
+  const mostSimilar = [...adjusted].sort((a, b) => a.sizeDelta - b.sizeDelta)[0];
+
+  const paperEstimate     = Math.round(medianPpsf * subject.sqft);
+  const marketEstimate    = Math.round(mostSimilar.adjustedPpsf * subject.sqft);
+  const low               = Math.round(sortedByPpsf[0].adjustedPpsf * subject.sqft);
+  const high              = Math.round(sortedByPpsf[sortedByPpsf.length-1].adjustedPpsf * subject.sqft);
 
   return {
-    estimate,
+    estimate:     paperEstimate, // back-compat: existing field name
+    paperEstimate,
+    marketEstimate,
     low,
     high,
-    medianPpsf: Math.round(medianPpsf),
+    medianPpsf:   Math.round(medianPpsf),
+    mostSimilar:  {
+      address: mostSimilar.address,
+      price:   Math.round(mostSimilar.price),
+      sqft:    mostSimilar.sqft,
+      ppsf:    Math.round(mostSimilar.ppsf),
+      sizeDeltaPct: Math.round(mostSimilar.sizeDelta * 100),
+      status:  mostSimilar.homeStatus,
+      isAgentIntel: mostSimilar.homeStatus === 'AGENT_INTEL',
+    },
     compsUsed:  adjusted,
   };
 }
@@ -271,6 +292,8 @@ async function fetchEstimate(client) {
     lat: p.latitude, lng: p.longitude,
   };
   const comparables = pickComparables(p.nearbyHomes, subject);
+  // Appraisal computed BELOW (in fetchAndPersist) so it can also include
+  // the client's manual off-market comps from Max's expertise.
   const appraisal   = computeAppraisalEstimate(subject, comparables);
 
   // Premium factors not captured in the median-$/sqft math
@@ -333,6 +356,29 @@ async function fetchAndPersist(client) {
 
   // Merge backfilled fields back into the client object so the email/preview see them
   const mergedClient = { ...client, ...patch, purchaseDate: patch.purchase_date || client.purchaseDate };
+
+  // If this client has manual off-market comps from Max's expertise, fold
+  // them into the appraisal math alongside the Zillow nearbyHomes. They
+  // typically include sales Zillow under-weights (off-market luxury, etc).
+  if (mergedClient.manualComps?.length) {
+    const subjectForAppraisal = {
+      sqft: v.sqft, beds: v.beds, baths: v.baths,
+    };
+    const combinedComps = [
+      ...(v.comparables || []),
+      ...mergedClient.manualComps.map(mc => ({
+        address:    mc.address,
+        price:      mc.price,
+        sqft:       mc.sqft,
+        beds:       mc.beds,
+        baths:      mc.baths,
+        homeStatus: 'AGENT_INTEL',
+        homeType:   v.homeType, // assume same as subject — Max wouldn't add unrelated comps
+      })),
+    ];
+    const reAppraisal = computeAppraisalEstimate(subjectForAppraisal, combinedComps);
+    if (reAppraisal) v.appraisal = reAppraisal;
+  }
 
   // Add derived "average appreciation per month since purchase"
   const purchase     = mergedClient.purchase     || v.purchasePrice;
@@ -489,17 +535,26 @@ function buildEmail(client, valData, senderName) {
 
     ${valData.appraisal && valData.appraisal.compsUsed?.length >= 3 ? `
     <div style="background:#f3f0e8;border:1px solid #e1d9c4;border-radius:8px;padding:14px 16px;margin-bottom:20px">
-      <div style="font-size:11px;font-weight:700;color:#5a4a1f;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px">Compass appraisal estimate</div>
-      <div style="font-size:13px;color:#666;margin-bottom:8px">Based on ${valData.appraisal.compsUsed.length} same-${valData.homeType === 'CONDO' ? 'building or same-street condo' : 'street single-family'} ${valData.appraisal.compsUsed.length === 1 ? 'comp' : 'comps'}, applying $/sqft and bed/bath adjustments (USPAP sales-comparison method):</div>
-      <table style="width:100%;border-collapse:collapse;font-size:13px">
-        <tr><td style="padding:3px 0;color:#666">Median $/sqft from comps</td>
-            <td style="padding:3px 0;text-align:right;font-weight:600">$${valData.appraisal.medianPpsf.toLocaleString()}/sqft</td></tr>
-        <tr><td style="padding:3px 0;color:#666">Adjusted range across comps</td>
-            <td style="padding:3px 0;text-align:right;font-weight:600">$${valData.appraisal.low.toLocaleString()} – $${valData.appraisal.high.toLocaleString()}</td></tr>
-        <tr><td style="padding:6px 0 0;color:#1a1a1a;font-weight:600;border-top:1px solid #e1d9c4">Our estimate</td>
-            <td style="padding:6px 0 0;text-align:right;font-weight:700;color:#1a1a1a;border-top:1px solid #e1d9c4">$${valData.appraisal.estimate.toLocaleString()}</td></tr>
-        <tr><td style="padding:3px 0;color:#888;font-size:12px">Zillow Zestimate for comparison</td>
-            <td style="padding:3px 0;text-align:right;font-weight:500;color:#888;font-size:12px">$${val.toLocaleString()}</td></tr>
+      <div style="font-size:11px;font-weight:700;color:#5a4a1f;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px">Compass valuation analysis</div>
+      <div style="font-size:12px;color:#666;margin-bottom:10px;line-height:1.5">Two ways of reading the comps from ${valData.appraisal.compsUsed.length} ${valData.homeType === 'CONDO' ? 'same-building/same-street condo' : 'same-street'} sales:</div>
+
+      <table style="width:100%;border-collapse:collapse;font-size:13px;margin-bottom:8px">
+        <tr><td style="padding:5px 0;color:#666"><strong>Paper value</strong> (USPAP median $/sqft)</td>
+            <td style="padding:5px 0;text-align:right;font-weight:700">$${valData.appraisal.paperEstimate.toLocaleString()}</td></tr>
+        <tr><td style="padding:5px 0;color:#666"><strong>Market signal</strong> (most-similar comp implied)</td>
+            <td style="padding:5px 0;text-align:right;font-weight:700;color:${valData.appraisal.marketEstimate > valData.appraisal.paperEstimate ? '#2d7a3a' : '#1a1a1a'}">$${valData.appraisal.marketEstimate.toLocaleString()}</td></tr>
+      </table>
+
+      ${valData.appraisal.mostSimilar ? `
+      <div style="font-size:12px;color:#666;background:#fff;border-radius:5px;padding:8px 10px;line-height:1.5;margin-bottom:10px">
+        Most-similar comp: <strong style="color:#1a1a1a">${valData.appraisal.mostSimilar.address}</strong>${valData.appraisal.mostSimilar.isAgentIntel ? ' (agent intel)' : ''}, ${valData.appraisal.mostSimilar.sqft.toLocaleString()} sqft (only ${valData.appraisal.mostSimilar.sizeDeltaPct}% size delta) at <strong style="color:#1a1a1a">$${valData.appraisal.mostSimilar.price.toLocaleString()}</strong> ($${valData.appraisal.mostSimilar.ppsf.toLocaleString()}/sqft).
+      </div>` : ''}
+
+      <table style="width:100%;border-collapse:collapse;font-size:12px;border-top:1px solid #e1d9c4;padding-top:8px">
+        <tr><td style="padding:6px 0 0;color:#888">Full comp range (adjusted)</td>
+            <td style="padding:6px 0 0;text-align:right;font-weight:500;color:#888">$${valData.appraisal.low.toLocaleString()} &ndash; $${valData.appraisal.high.toLocaleString()}</td></tr>
+        <tr><td style="padding:3px 0;color:#888">Zillow Zestimate</td>
+            <td style="padding:3px 0;text-align:right;font-weight:500;color:#888">$${val.toLocaleString()}</td></tr>
       </table>
     </div>` : ''}
 
