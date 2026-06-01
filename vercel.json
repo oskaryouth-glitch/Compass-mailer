@@ -7,8 +7,9 @@
     }
   },
   "rewrites": [
-    { "source": "/api/(.*)", "destination": "/api/index" },
-    { "source": "/auth/(.*)", "destination": "/api/index" }
+    { "source": "/api/(.*)",  "destination": "/api/index" },
+    { "source": "/auth/(.*)", "destination": "/api/index" },
+    { "source": "/(.*)",      "destination": "/api/index" }
   ],
   "crons": [
     {

@@ -58,7 +58,40 @@ function detectBoutiquePremium(subjectAddr, comps) {
 
 const app = express();
 app.use(express.json({ limit: '5mb' }));
-app.use(express.static(path.join(__dirname, 'public')));
+
+// ── HTTP Basic Auth ──────────────────────────────────────────────────────────
+// Gate the whole dashboard + API behind a single username/password pair.
+// Vercel Cron is skipped (it has its own CRON_SECRET).
+const AUTH_USER     = process.env.AUTH_USER;
+const AUTH_PASSWORD = process.env.AUTH_PASSWORD;
+
+app.use((req, res, next) => {
+  // Cron endpoint authenticates with CRON_SECRET, not basic auth
+  if (req.path === '/api/cron/monthly') return next();
+  // If basic auth isn't configured, allow through (local dev)
+  if (!AUTH_USER || !AUTH_PASSWORD) return next();
+
+  const sendChallenge = () => {
+    res.set('WWW-Authenticate', 'Basic realm="Compass Mailer"');
+    res.status(401).send('Authentication required');
+  };
+
+  const auth = req.headers.authorization || '';
+  if (!auth.startsWith('Basic ')) return sendChallenge();
+
+  try {
+    const decoded = Buffer.from(auth.slice(6), 'base64').toString('utf8');
+    const i = decoded.indexOf(':');
+    const user = decoded.slice(0, i);
+    const pass = decoded.slice(i + 1);
+    if (user === AUTH_USER && pass === AUTH_PASSWORD) return next();
+  } catch { /* fall through */ }
+  return sendChallenge();
+});
+
+// Serve dashboard from /web (not /public — Vercel auto-serves /public from
+// edge cache, which would bypass our basic-auth middleware).
+app.use(express.static(path.join(__dirname, 'web')));
 
 const APIFY_TOKEN          = process.env.APIFY_TOKEN;
 const GMAIL_CLIENT_ID      = process.env.GMAIL_CLIENT_ID;
