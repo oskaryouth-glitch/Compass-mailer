@@ -106,10 +106,20 @@
   <div class="sidebar">
     <div class="sidebar-head">
       <h2>Settings</h2>
-      <div style="font-size:12px;color:#666;line-height:1.5">
-        Apify token, Resend API key, and database URL are configured via environment variables. Edit your <code style="background:#f0ede8;padding:1px 4px;border-radius:3px;font-size:11px">.env</code> file (local) or your Vercel project settings (production).
+      <div style="font-size:12px;color:#666;line-height:1.5;margin-bottom:10px">
+        Apify, Gmail, and DB config live in environment variables.
       </div>
-      <div id="sender-info" style="font-size:11px;color:#888;margin-top:10px"></div>
+      <div id="sender-info" style="font-size:11px;color:#888;margin-bottom:12px"></div>
+
+      <div style="background:#fdfaf0;border:1px solid #e1d9c4;border-radius:6px;padding:8px">
+        <div style="font-size:11px;color:#5a4a1f;font-weight:700;margin-bottom:6px">📥 Bulk import SFAR / MLS CSV</div>
+        <input type="file" id="csv-file" accept=".csv" style="font-size:11px;width:100%;margin-bottom:6px" />
+        <label style="display:block;font-size:11px;color:#666;margin-bottom:6px">
+          <input type="checkbox" id="csv-replace" style="vertical-align:middle" /> Replace existing comps (else: append)
+        </label>
+        <button onclick="importCsv()" id="csv-btn" class="save-btn" style="width:100%">Import</button>
+        <div style="font-size:10px;color:#aaa;margin-top:4px;line-height:1.4">Auto-routes rows to clients by zip + sqft. Expects SFAR/Rapattoni-style headers.</div>
+      </div>
     </div>
     <div class="stats">
       <div class="stat"><div class="stat-num" id="st-total">5</div><div class="stat-label">Clients</div></div>
@@ -165,6 +175,16 @@
         <div class="card" style="background:#fdfaf0;border-color:#e1d9c4">
           <div class="card-title" style="color:#5a4a1f">Off-market sales I know about</div>
           <div style="font-size:11px;color:#888;margin-bottom:10px;line-height:1.5">Pocket listings, private sales, comps your client should know about. Zillow can't see these. They'll render as <em>"Off-market sales I've seen"</em> in the email.</div>
+
+          <div style="background:#fff;border:1px solid #e1d9c4;border-radius:6px;padding:8px;margin-bottom:10px">
+            <div style="font-size:11px;color:#5a4a1f;font-weight:600;margin-bottom:6px">⚡ Quick add by address or Zillow URL</div>
+            <div style="display:flex;gap:5px">
+              <input id="quick-lookup-addr" placeholder="2898 Vallejo St, SF or zillow.com/homedetails/..." style="flex:1;padding:6px 8px;border:1px solid #ddd;border-radius:5px;font-size:11px;font-family:monospace" />
+              <button onclick="quickLookup()" id="quick-lookup-btn" class="save-btn" style="white-space:nowrap;padding:6px 10px">Look up</button>
+            </div>
+            <div style="font-size:10px;color:#aaa;margin-top:4px">Fetches beds/baths/sqft/price from Zillow, auto-adds as a comp.</div>
+          </div>
+
           <div id="manual-comps-list"></div>
           <details style="margin-top:8px">
             <summary style="font-size:12px;color:#5a4a1f;font-weight:600;cursor:pointer;padding:6px 0">+ Add an off-market comp</summary>
@@ -392,6 +412,76 @@ async function saveManualComps(comps) {
     } catch (e) { /* silent — comp still saved */ }
   }
   return true;
+}
+
+async function importCsv() {
+  const file = document.getElementById('csv-file').files[0];
+  if (!file) { toast('Pick a CSV file first'); return; }
+  const replace = document.getElementById('csv-replace').checked;
+  const btn = document.getElementById('csv-btn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Importing…';
+  try {
+    const csv = await file.text();
+    const r = await fetch('/api/import-csv', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ csv, replace }),
+    });
+    const d = await r.json();
+    if (d.error) { toast('Error: ' + d.error); console.error(d); return; }
+    let summary = `${d.totalRows} rows parsed.\n`;
+    Object.values(d.perClient).forEach(p => {
+      summary += `\n${p.name} (${p.zip}): ${p.matchedThisZip} matched zip → ${p.added} added → ${p.totalNow} total comps`;
+    });
+    alert(summary);
+    await loadStatus();
+    // Refresh the live preview for the currently selected client
+    const c = clients[selected];
+    if (c && liveVals[c.id]) {
+      const r2 = await fetch(`/api/estimate/${c.id}`, { method: 'POST' });
+      const d2 = await r2.json();
+      if (!d2.error) { liveVals[c.id] = d2; renderSelected(); }
+    }
+  } catch (e) {
+    toast('Error: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = 'Import';
+  }
+}
+
+async function quickLookup() {
+  const input = document.getElementById('quick-lookup-addr').value.trim();
+  if (!input) { toast('Paste an address or Zillow URL'); return; }
+  const btn = document.getElementById('quick-lookup-btn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>';
+  const c = clients[selected];
+  try {
+    const r = await fetch(`/api/clients/${c.id}/comp-lookup`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ address: input }),
+    });
+    const d = await r.json();
+    if (d.error) { toast('Error: ' + d.error); return; }
+    c.manualComps = d.comps;
+    renderManualComps(c);
+    document.getElementById('quick-lookup-addr').value = '';
+    toast(`Added: ${d.added.address.split(',')[0]} at $${d.added.price.toLocaleString()}`);
+    // Refresh email preview if we already have an estimate fetched
+    if (liveVals[c.id]) {
+      const r2 = await fetch(`/api/estimate/${c.id}`, { method: 'POST' });
+      const d2 = await r2.json();
+      if (!d2.error) { liveVals[c.id] = d2; renderSelected(); }
+    }
+  } catch (e) {
+    toast('Error: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = 'Look up';
+  }
 }
 
 async function addManualComp() {

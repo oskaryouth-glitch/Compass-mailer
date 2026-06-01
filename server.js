@@ -57,7 +57,7 @@ function detectBoutiquePremium(subjectAddr, comps) {
 }
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '5mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 const APIFY_TOKEN          = process.env.APIFY_TOKEN;
@@ -775,6 +775,256 @@ app.post('/api/clients', async (req, res) => {
   try {
     await db.replaceAllClients(req.body.clients || []);
     res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Minimal CSV parser — handles standard CSV with quoted fields containing
+// commas, but doesn't support multi-line quoted fields. SFAR/Rapattoni
+// exports are well-formed so this is fine.
+function parseCsv(text) {
+  const rows = [];
+  const lines = text.split(/\r?\n/).filter(l => l.length);
+  for (const line of lines) {
+    const fields = [];
+    let cur = '', inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (inQuotes) {
+        if (ch === '"' && line[i+1] === '"') { cur += '"'; i++; }
+        else if (ch === '"') inQuotes = false;
+        else cur += ch;
+      } else {
+        if (ch === '"') inQuotes = true;
+        else if (ch === ',') { fields.push(cur); cur = ''; }
+        else cur += ch;
+      }
+    }
+    fields.push(cur);
+    rows.push(fields);
+  }
+  return rows;
+}
+
+// Heuristic column matcher — handles SFAR / Rapattoni / generic MLS naming.
+// Each canonical key has an array of header-text patterns it accepts (lowercase).
+const CSV_COLUMN_PATTERNS = {
+  address:   ['address','street address','full address','street number name'],
+  streetNum: ['street number','street #','st no'],
+  streetName:['street name','street','street name direction'],
+  city:      ['city'],
+  state:     ['state','st'],
+  zip:       ['zip','zipcode','zip code','postal'],
+  price:     ['close price','closed price','sold price','sale price','list/close $','close $','last sale price','price'],
+  beds:      ['beds','bedrooms','bd','br'],
+  baths:     ['baths','bathrooms','ba','total bathrooms'],
+  sqft:      ['sqft','sq ft','sq.ft.','living area','approx sqft','sqft (approx)','square feet'],
+  soldDate:  ['close date','closed date','contractual date','sold date','sale date'],
+  subtype:   ['subtype','subtype description','property subtype','type'],
+  mlsOrigin: ['mls origin','source mls','listing source'],
+  units:     ['# of units','num units','units in building','units'],
+  subdistrict:['subdistrict','neighborhood','district'],
+  listing:   ['listing #','listing number','mls #','mls number'],
+};
+
+function findColumn(headers, key) {
+  const patterns = CSV_COLUMN_PATTERNS[key] || [];
+  const lower = headers.map(h => (h || '').toLowerCase().trim());
+  for (const p of patterns) {
+    const i = lower.findIndex(h => h === p);
+    if (i >= 0) return i;
+  }
+  // Fallback to partial match
+  for (const p of patterns) {
+    const i = lower.findIndex(h => h.includes(p));
+    if (i >= 0) return i;
+  }
+  return -1;
+}
+
+function rowToComp(row, idx) {
+  const get = key => {
+    const i = idx[key];
+    return i >= 0 ? (row[i] || '').trim() : '';
+  };
+  const toMoney = s => {
+    const n = Number.parseFloat((s || '').replace(/[^0-9.]/g, ''));
+    return Number.isFinite(n) && n > 0 ? n : null;
+  };
+  const toInt = s => {
+    const n = Number.parseInt((s || '').replace(/[^0-9]/g, ''), 10);
+    return Number.isFinite(n) ? n : null;
+  };
+  const toFloat = s => {
+    const n = Number.parseFloat((s || '').replace(/[^0-9.]/g, ''));
+    return Number.isFinite(n) ? n : null;
+  };
+
+  // Build full address from whatever fields exist
+  let address = get('address');
+  if (!address) {
+    const num = get('streetNum'), name = get('streetName'), city = get('city'), state = get('state'), zip = get('zip');
+    address = [num + ' ' + name, city, state + ' ' + zip].map(s => s.trim()).filter(Boolean).join(', ');
+  }
+  if (!address) return null;
+
+  const price = toMoney(get('price'));
+  if (!price) return null;
+
+  // Extract zip from address if needed
+  let zip = get('zip');
+  if (!zip) {
+    const m = address.match(/\b(\d{5})\b/);
+    if (m) zip = m[1];
+  }
+
+  return {
+    address,
+    price,
+    beds:     toInt(get('beds')),
+    baths:    toFloat(get('baths')),
+    sqft:     toInt(get('sqft')),
+    soldDate: get('soldDate') || null,
+    note:     get('mlsOrigin') ? `MLS Origin: ${get('mlsOrigin')}${get('subdistrict') ? ' · ' + get('subdistrict') : ''}` : null,
+    zip,
+    subtype:  get('subtype'),
+  };
+}
+
+// Bulk CSV import: takes the raw CSV body, parses it, and distributes rows
+// to clients by zip + sqft proximity. Returns a per-client summary.
+app.post('/api/import-csv', async (req, res) => {
+  try {
+    const csv = req.body.csv || '';
+    if (!csv || typeof csv !== 'string' || csv.length < 50) {
+      return res.status(400).json({ error: 'No CSV body provided' });
+    }
+    const rows = parseCsv(csv);
+    if (rows.length < 2) return res.status(400).json({ error: 'CSV has no data rows' });
+
+    const headers = rows[0];
+    const idx = {};
+    for (const k of Object.keys(CSV_COLUMN_PATTERNS)) idx[k] = findColumn(headers, k);
+    if (idx.price === -1) return res.status(400).json({ error: 'Could not find a price/sold-price column. Header row received: ' + headers.join(', ') });
+
+    const comps = rows.slice(1).map(r => rowToComp(r, idx)).filter(Boolean);
+    const clients = await db.listClients();
+
+    // Match comps to clients: same zip, similar property type (SFR-vs-condo),
+    // sqft within 50%-200% of subject
+    const replace = req.body.replace === true; // if true, wipe existing manual_comps first
+    const perClient = {};
+
+    for (const c of clients) {
+      const subjectIsCondo = /condo/i.test('') || c.beds === null; // weak signal w/o homeType in DB
+      const candidates = comps
+        .filter(comp => comp.zip && comp.zip === c.zip)
+        .filter(comp => !c.sqft || !comp.sqft || (comp.sqft >= c.sqft * 0.5 && comp.sqft <= c.sqft * 2.0))
+        .sort((a, b) => {
+          if (!c.sqft) return 0;
+          const da = Math.abs((a.sqft || c.sqft) - c.sqft);
+          const db = Math.abs((b.sqft || c.sqft) - c.sqft);
+          return da - db;
+        })
+        .slice(0, 10) // cap per client
+        .map(({ zip, subtype, ...keep }) => keep); // strip routing fields
+
+      const existing = replace ? [] : (c.manualComps || []);
+      // Dedupe by address (case-insensitive)
+      const seen = new Set(existing.map(e => (e.address || '').toLowerCase()));
+      const additions = candidates.filter(comp => !seen.has(comp.address.toLowerCase()));
+      const merged = [...existing, ...additions].slice(-10);
+
+      if (additions.length || replace) {
+        await db.setManualComps(c.id, merged);
+      }
+      perClient[c.id] = {
+        name: c.name,
+        zip: c.zip,
+        matchedThisZip: comps.filter(comp => comp.zip === c.zip).length,
+        added: additions.length,
+        totalNow: merged.length,
+      };
+    }
+
+    res.json({
+      ok: true,
+      totalRows: comps.length,
+      headersDetected: idx,
+      perClient,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Quick-add a manual comp by address or Zillow URL. We call the
+// zillow-detail-scraper to look it up, then auto-append as a manual comp.
+// Solves: Max sees a $50M sale on Zillow → one paste → it lands in the client's
+// comp list without retyping beds/baths/sqft.
+app.post('/api/clients/:id/comp-lookup', async (req, res) => {
+  try {
+    if (!APIFY_TOKEN) return res.status(400).json({ error: 'Apify not configured' });
+    const id = parseInt(req.params.id);
+    const client = await db.getClient(id);
+    if (!client) return res.status(404).json({ error: 'Client not found' });
+
+    const input = (req.body.address || '').trim();
+    if (!input) return res.status(400).json({ error: 'Address or URL required' });
+
+    // Accept either a plain address or a Zillow URL
+    let lookupAddress = input;
+    const urlMatch = input.match(/zillow\.com\/homedetails\/([^/]+)\//);
+    if (urlMatch) {
+      // Slug "2898-Vallejo-St-San-Francisco-CA-94123" → readable address
+      lookupAddress = urlMatch[1].replace(/-/g, ' ').trim();
+    }
+
+    const lookup = await axios.post(
+      `https://api.apify.com/v2/acts/maxcopell~zillow-detail-scraper/run-sync-get-dataset-items?token=${APIFY_TOKEN}&timeout=300`,
+      { addresses: [lookupAddress], propertyStatus: 'RECENTLY_SOLD' },
+      { headers: { 'Content-Type': 'application/json' }, timeout: 320000 }
+    );
+    const items = Array.isArray(lookup.data) ? lookup.data : [];
+    if (!items.length) return res.status(404).json({ error: 'Property not found on Zillow' });
+    const p = items[0];
+
+    // Pick the best price: most recent Sold > Zestimate > lastSoldPrice > price
+    const lastSold = (p.priceHistory || []).filter(h => h.event === 'Sold')
+      .sort((a,b) => (b.time||0) - (a.time||0))[0];
+    const usingSale = !!lastSold;
+    const price = lastSold?.price || p.zestimate || p.lastSoldPrice || p.price;
+    if (!price) return res.status(400).json({ error: 'Zillow has no price for this property' });
+
+    const fullAddr = `${p.streetAddress}, ${p.city}, ${p.state} ${p.zipcode}`;
+    const soldDate = lastSold?.date || (p.dateSold ? new Date(p.dateSold).toISOString().slice(0,10) : null);
+
+    let note;
+    if (usingSale) {
+      note = `Sold ${lastSold.date} ($${Math.round(price/Math.max(p.livingArea||1,1)).toLocaleString()}/sqft). Via Zillow lookup.`;
+    } else if (p.zestimate) {
+      note = `Zillow Zestimate $${p.zestimate.toLocaleString()}. Not yet recorded as sold. Via Zillow lookup.`;
+    } else {
+      note = `Via Zillow lookup.`;
+    }
+
+    const newComp = {
+      address:  fullAddr,
+      price:    Math.round(price),
+      beds:     p.bedrooms ?? null,
+      baths:    p.bathrooms ?? null,
+      sqft:     p.livingArea ?? null,
+      soldDate,
+      note,
+    };
+
+    const existing = client.manualComps || [];
+    // Avoid duplicates by address (case-insensitive)
+    const dedup = existing.filter(c => (c.address || '').toLowerCase() !== fullAddr.toLowerCase());
+    const combined = [...dedup, newComp].slice(-10); // cap 10 per client
+    await db.setManualComps(id, combined);
+    res.json({ ok: true, added: newComp, comps: combined });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
