@@ -366,10 +366,6 @@ async function fetchAndPersist(client) {
   if (!client.purchaseDate && v.purchaseDate)  patch.purchase_date = v.purchaseDate;
   if (Object.keys(patch).length) await db.patchClient(client.id, patch);
 
-  // Record this snapshot so the graph builds real history over time
-  await db.recordHistory(client.id, v.price);
-  const history = await db.getHistory(client.id);
-
   // Merge backfilled fields back into the client object so the email/preview see them
   const mergedClient = { ...client, ...patch, purchaseDate: patch.purchase_date || client.purchaseDate };
 
@@ -396,21 +392,33 @@ async function fetchAndPersist(client) {
     if (reAppraisal) v.appraisal = reAppraisal;
   }
 
-  // Add derived "average appreciation per month since purchase"
+  // Headline number: midpoint of our Compass range. This is THE value we
+  // present to the client; Zillow Zestimate becomes a small reference line.
+  // Falls back to Zillow Zestimate if no comp-based appraisal was computed.
+  const compassValue = v.appraisal
+    ? Math.round((v.appraisal.rangeLow + v.appraisal.rangeHigh) / 2)
+    : v.price;
+
+  // Record THIS snapshot (the Compass headline) so the graph builds real
+  // history of OUR number over time, not Zillow's.
+  await db.recordHistory(client.id, compassValue);
+  const history = await db.getHistory(client.id);
+
+  // All gain / monthly / annualized math uses the Compass headline, not Zillow.
   const purchase     = mergedClient.purchase     || v.purchasePrice;
   const purchaseDate = mergedClient.purchaseDate || v.purchaseDate;
   let monthlyAppreciation = null, monthsHeld = null;
   if (purchase && purchaseDate) {
     const ms = Date.now() - new Date(purchaseDate).getTime();
     monthsHeld = Math.max(1, Math.round(ms / (1000 * 60 * 60 * 24 * 30.4375)));
-    monthlyAppreciation = Math.round((v.price - purchase) / monthsHeld);
+    monthlyAppreciation = Math.round((compassValue - purchase) / monthsHeld);
   }
 
   // Layer in market intel: mortgage rate context, SF-metro annualized return,
   // and zip-level transaction activity. All run in parallel and degrade
   // gracefully if any external source fails.
   const [rateContext, marketReturn, zipStats] = await Promise.all([
-    market.getRateContext(purchaseDate, purchase, v.price),
+    market.getRateContext(purchaseDate, purchase, compassValue),
     market.getMarketReturn(purchaseDate),
     zipActivity.getZipActivity(APIFY_TOKEN, v.lat, v.lng, v.zipcode),
   ]);
@@ -420,14 +428,14 @@ async function fetchAndPersist(client) {
   if (purchase && monthsHeld) {
     const years = monthsHeld / 12;
     if (years > 0 && purchase > 0) {
-      homeAnnualized = Math.pow(v.price / purchase, 1 / years) - 1;
+      homeAnnualized = Math.pow(compassValue / purchase, 1 / years) - 1;
     }
   }
 
   const enriched = {
     ...v, history, monthlyAppreciation, monthsHeld,
     rateContext, marketReturn, homeAnnualized,
-    zipStats,
+    zipStats, compassValue,
   };
 
   // Render the actual email HTML so the dashboard preview matches what gets sent
@@ -450,7 +458,10 @@ function marketName(city) {
 
 // ── Email builder ─────────────────────────────────────────────────────────────
 function buildEmail(client, valData, senderName) {
-  const val = valData.price;
+  // PRIMARY value shown to client = Compass headline (midpoint of our range).
+  // Zillow Zestimate becomes a small reference footnote.
+  const val = valData.compassValue || valData.price;
+  const zestimate = valData.price; // Zillow Zestimate, for reference line
   const prev = client.lastVal;
   const change = (prev && prev !== val) ? val - prev : null;
   const purchase     = client.purchase     || valData.purchasePrice;
@@ -542,11 +553,14 @@ function buildEmail(client, valData, senderName) {
     <p style="font-size:15px;margin:0 0 20px">Hi ${firstName},</p>
     <p style="font-size:15px;margin:0 0 24px;line-height:1.6">Here's your monthly home value update for <strong>${client.addr}, ${client.city}</strong>.</p>
 
-    <div style="background:#f8f8f8;border-radius:8px;padding:24px;text-align:center;margin-bottom:24px">
+    <div style="background:#f8f8f8;border-radius:8px;padding:28px 24px;text-align:center;margin-bottom:24px">
       <div style="font-size:13px;color:#888;margin-bottom:6px;text-transform:uppercase;letter-spacing:.06em">Estimated value</div>
-      <div style="font-size:40px;font-weight:700;letter-spacing:-1px">$${Math.round(val).toLocaleString()}</div>
-      <div style="font-size:14px;color:${change >= 0 ? '#2d7a3a' : '#c0392b'};margin-top:8px">${changeLine}</div>
-      <div style="font-size:12px;color:#aaa;margin-top:6px">Range: $${Math.round(valData.priceRangeLow).toLocaleString()} – $${Math.round(valData.priceRangeHigh).toLocaleString()}</div>
+      <div style="font-size:44px;font-weight:800;letter-spacing:-1.5px;color:#1a1a1a;line-height:1">$${Math.round(val).toLocaleString()}</div>
+      ${valData.appraisal && valData.appraisal.rangeLow && valData.appraisal.rangeHigh ? `
+      <div style="font-size:13px;color:#666;margin-top:8px;font-weight:500">Market range: $${valData.appraisal.rangeLow.toLocaleString()} – $${valData.appraisal.rangeHigh.toLocaleString()}</div>` : ''}
+      <div style="font-size:14px;color:${(change ?? 0) >= 0 ? '#2d7a3a' : '#c0392b'};margin-top:10px;font-weight:500">${changeLine}</div>
+      ${zestimate && zestimate !== val ? `
+      <div style="font-size:11px;color:#aaa;margin-top:14px;padding-top:12px;border-top:1px solid #eee">Zillow Zestimate for reference: $${zestimate.toLocaleString()}</div>` : ''}
     </div>
 
     ${purchaseHtml}
@@ -556,20 +570,9 @@ function buildEmail(client, valData, senderName) {
       <strong>Heads up:</strong> ${valData.boutiquePremium.note}
     </div>` : ''}
 
-    ${valData.appraisal && valData.appraisal.compsUsed?.length >= 3 ? `
-    <div style="background:#f3f0e8;border:1px solid #e1d9c4;border-radius:8px;padding:16px 18px;margin-bottom:20px">
-      <div style="font-size:11px;font-weight:700;color:#5a4a1f;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px">Compass valuation</div>
-      <div style="font-size:13px;color:#444;margin-bottom:12px;line-height:1.5">
-        Based on ${valData.appraisal.compsUsed.length} recent comparable sales weighted toward the upper market (top 25% of $/sqft), with bed/bath adjustments per USPAP sales-comparison method.
-      </div>
-      <div style="text-align:center;padding:10px 0">
-        <div style="font-size:13px;color:#888;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Estimated market range</div>
-        <div style="font-size:28px;font-weight:800;letter-spacing:-0.5px;color:#1a1a1a;line-height:1.2">$${valData.appraisal.rangeLow.toLocaleString()} &ndash; $${valData.appraisal.rangeHigh.toLocaleString()}</div>
-      </div>
-      ${valData.appraisal.mostSimilar ? `
-      <div style="font-size:12px;color:#666;background:#fff;border-radius:5px;padding:9px 11px;line-height:1.5;margin-top:10px">
-        Anchored on <strong style="color:#1a1a1a">${valData.appraisal.mostSimilar.address}</strong>${valData.appraisal.mostSimilar.isAgentIntel ? ' (off-market)' : ''}, ${valData.appraisal.mostSimilar.sqft.toLocaleString()} sqft (${valData.appraisal.mostSimilar.sizeDeltaPct}% size delta from yours) at <strong style="color:#1a1a1a">$${valData.appraisal.mostSimilar.price.toLocaleString()}</strong>.
-      </div>` : ''}
+    ${valData.appraisal && valData.appraisal.compsUsed?.length >= 3 && valData.appraisal.mostSimilar ? `
+    <div style="font-size:12px;color:#666;line-height:1.5;margin:0 0 20px;padding:10px 14px;background:#fafaf8;border-radius:6px">
+      Anchored on <strong style="color:#1a1a1a">${valData.appraisal.mostSimilar.address}</strong>${valData.appraisal.mostSimilar.isAgentIntel ? ' (off-market intel)' : ''}, ${valData.appraisal.mostSimilar.sqft.toLocaleString()} sqft (${valData.appraisal.mostSimilar.sizeDeltaPct}% size delta) at <strong style="color:#1a1a1a">$${valData.appraisal.mostSimilar.price.toLocaleString()}</strong>. Range based on ${valData.appraisal.compsUsed.length} comparable sales weighted toward the upper market.
     </div>` : ''}
 
     ${(valData.homeAnnualized != null && valData.marketReturn) ? `
