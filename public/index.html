@@ -211,7 +211,10 @@
       </div>
 
       <div class="right">
-        <div class="card-title" style="padding:0 0 6px">Email preview</div>
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:0 0 6px">
+          <div class="card-title" style="padding:0">Email preview</div>
+          <a id="open-email-link" href="#" target="_blank" style="font-size:11px;color:#1a4a7a;font-weight:600;text-decoration:none">Open in new tab ↗</a>
+        </div>
         <div class="email-wrap">
           <div class="email-hdr">
             <div class="email-from" id="e-from">From: Max · Compass</div>
@@ -600,6 +603,8 @@ function drawSpark(c, val, live){
 function updateEmailPreview(c, val, change, live){
   const monthLabel = new Date().toLocaleDateString('en-US',{month:'long',year:'numeric'});
   document.getElementById('e-subj').textContent = `Your ${c.addr} home value — ${monthLabel}`;
+  const link = document.getElementById('open-email-link');
+  if(link) link.href = `/api/preview/${c.id}`;
   const note = document.getElementById('preview-note');
   if (live && live.previewHtml) {
     document.getElementById('e-body').innerHTML = live.previewHtml;

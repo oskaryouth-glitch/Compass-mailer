@@ -171,12 +171,18 @@ function pickComparables(nearbyHomes, subject) {
     .slice(0, 6);
 }
 
-// Appraiser-style sales-comparison valuation (USPAP-flavored), but also
-// honest about hot-market reality. We compute three views:
-//   1. "Paper" estimate — median adjusted $/sqft (USPAP standard, conservative)
-//   2. "Most similar comp" estimate — the single closest-by-sqft comp's $/sqft
-//      applied to the subject. Shows what the most directly relevant trade implies.
-//   3. Comp range — low and high adjusted values across all comps.
+// Sales-comparison valuation that leans into the upper part of the market.
+// Instead of the USPAP median (which gives a conservative paper number), we
+// anchor on the 75th percentile of adjusted $/sqft and quote a RANGE that goes
+// up to the 90th percentile (or the top off-market comp). The bottom of the
+// range gets dropped — a client at the top of their market doesn't need to
+// see "$10M floor" comps in their email.
+function percentile(sortedAsc, p) {
+  if (!sortedAsc?.length) return null;
+  const idx = Math.min(sortedAsc.length - 1, Math.max(0, Math.floor(sortedAsc.length * p)));
+  return sortedAsc[idx];
+}
+
 function computeAppraisalEstimate(subject, comps) {
   if (!subject.sqft || !comps?.length) return null;
 
@@ -199,29 +205,38 @@ function computeAppraisalEstimate(subject, comps) {
 
   if (!adjusted.length) return null;
 
-  // Median adjusted $/sqft (conservative paper number)
-  const sortedByPpsf = [...adjusted].sort((a, b) => a.adjustedPpsf - b.adjustedPpsf);
-  const mid = Math.floor(sortedByPpsf.length / 2);
-  const medianPpsf = sortedByPpsf.length % 2 === 1
-    ? sortedByPpsf[mid].adjustedPpsf
-    : (sortedByPpsf[mid-1].adjustedPpsf + sortedByPpsf[mid].adjustedPpsf) / 2;
+  const sortedPpsf = adjusted.map(c => c.adjustedPpsf).sort((a, b) => a - b);
+  const medianPpsf       = percentile(sortedPpsf, 0.50);
+  const upperPpsf        = percentile(sortedPpsf, 0.75); // 75th pct, top quartile
+  const top90Ppsf        = percentile(sortedPpsf, 0.90); // 90th pct
+  const maxPpsf          = sortedPpsf[sortedPpsf.length - 1];
 
-  // Most-similar comp by sqft distance (the single most-defensible single reference)
+  // Most-similar comp by sqft distance — kept for the "most similar" callout
   const mostSimilar = [...adjusted].sort((a, b) => a.sizeDelta - b.sizeDelta)[0];
 
-  const paperEstimate     = Math.round(medianPpsf * subject.sqft);
+  // Top comps by price (for display in email — the impressive ones only)
+  const topCompsByPrice = [...adjusted]
+    .sort((a, b) => b.price - a.price)
+    .slice(0, 5);
+
+  const lowRangeEstimate  = Math.round(upperPpsf * subject.sqft);          // bottom of presented range
+  const highRangeEstimate = Math.round(Math.max(top90Ppsf, maxPpsf * 0.85) * subject.sqft); // top of range
+  const paperEstimate     = Math.round(medianPpsf * subject.sqft);         // kept internal
   const marketEstimate    = Math.round(mostSimilar.adjustedPpsf * subject.sqft);
-  const low               = Math.round(sortedByPpsf[0].adjustedPpsf * subject.sqft);
-  const high              = Math.round(sortedByPpsf[sortedByPpsf.length-1].adjustedPpsf * subject.sqft);
 
   return {
-    estimate:     paperEstimate, // back-compat: existing field name
+    // back-compat field
+    estimate: lowRangeEstimate,
+    // new range-based fields used by the email
+    rangeLow:  lowRangeEstimate,
+    rangeHigh: highRangeEstimate,
+    // legacy fields preserved (used elsewhere or for debugging)
     paperEstimate,
     marketEstimate,
-    low,
-    high,
-    medianPpsf:   Math.round(medianPpsf),
-    mostSimilar:  {
+    medianPpsf: Math.round(medianPpsf),
+    upperPpsf:  Math.round(upperPpsf),
+    top90Ppsf:  Math.round(top90Ppsf),
+    mostSimilar: {
       address: mostSimilar.address,
       price:   Math.round(mostSimilar.price),
       sqft:    mostSimilar.sqft,
@@ -230,7 +245,8 @@ function computeAppraisalEstimate(subject, comps) {
       status:  mostSimilar.homeStatus,
       isAgentIntel: mostSimilar.homeStatus === 'AGENT_INTEL',
     },
-    compsUsed:  adjusted,
+    topCompsByPrice,
+    compsUsed: adjusted,
   };
 }
 
@@ -469,7 +485,14 @@ function buildEmail(client, valData, senderName) {
     if (s === 'PENDING')       return '#7a5018';
     return '#999';
   }
-  const compsHtml = (valData.comparables || []).slice(0, 4).map(c => `
+  // Prefer the appraisal's "top comps by price" so we show the impressive ones
+  // first. Fall back to the raw nearbyHomes comparables if the appraisal block
+  // didn't compute (e.g. subject sqft unknown).
+  const displayComps = (valData.appraisal?.topCompsByPrice?.length
+      ? valData.appraisal.topCompsByPrice
+      : (valData.comparables || []))
+    .slice(0, 5);
+  const compsHtml = displayComps.map(c => `
     <tr style="border-bottom:1px solid #f4f1ec">
       <td style="padding:8px 0;font-size:13px">
         <div style="font-weight:600;color:#1a1a1a">${c.address}</div>
@@ -534,48 +557,20 @@ function buildEmail(client, valData, senderName) {
     </div>` : ''}
 
     ${valData.appraisal && valData.appraisal.compsUsed?.length >= 3 ? `
-    <div style="background:#f3f0e8;border:1px solid #e1d9c4;border-radius:8px;padding:14px 16px;margin-bottom:20px">
-      <div style="font-size:11px;font-weight:700;color:#5a4a1f;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px">Compass valuation analysis</div>
-      <div style="font-size:12px;color:#666;margin-bottom:10px;line-height:1.5">Two ways of reading the comps from ${valData.appraisal.compsUsed.length} ${valData.homeType === 'CONDO' ? 'same-building/same-street condo' : 'same-street'} sales:</div>
-
-      <table style="width:100%;border-collapse:collapse;font-size:13px;margin-bottom:8px">
-        <tr><td style="padding:5px 0;color:#666"><strong>Paper value</strong> (USPAP median $/sqft)</td>
-            <td style="padding:5px 0;text-align:right;font-weight:700">$${valData.appraisal.paperEstimate.toLocaleString()}</td></tr>
-        <tr><td style="padding:5px 0;color:#666"><strong>Market signal</strong> (most-similar comp implied)</td>
-            <td style="padding:5px 0;text-align:right;font-weight:700;color:${valData.appraisal.marketEstimate > valData.appraisal.paperEstimate ? '#2d7a3a' : '#1a1a1a'}">$${valData.appraisal.marketEstimate.toLocaleString()}</td></tr>
-      </table>
-
+    <div style="background:#f3f0e8;border:1px solid #e1d9c4;border-radius:8px;padding:16px 18px;margin-bottom:20px">
+      <div style="font-size:11px;font-weight:700;color:#5a4a1f;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px">Compass valuation</div>
+      <div style="font-size:13px;color:#444;margin-bottom:12px;line-height:1.5">
+        Based on ${valData.appraisal.compsUsed.length} recent comparable sales weighted toward the upper market (top 25% of $/sqft), with bed/bath adjustments per USPAP sales-comparison method.
+      </div>
+      <div style="text-align:center;padding:10px 0">
+        <div style="font-size:13px;color:#888;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Estimated market range</div>
+        <div style="font-size:28px;font-weight:800;letter-spacing:-0.5px;color:#1a1a1a;line-height:1.2">$${valData.appraisal.rangeLow.toLocaleString()} &ndash; $${valData.appraisal.rangeHigh.toLocaleString()}</div>
+      </div>
       ${valData.appraisal.mostSimilar ? `
-      <div style="font-size:12px;color:#666;background:#fff;border-radius:5px;padding:8px 10px;line-height:1.5;margin-bottom:10px">
-        Most-similar comp: <strong style="color:#1a1a1a">${valData.appraisal.mostSimilar.address}</strong>${valData.appraisal.mostSimilar.isAgentIntel ? ' (agent intel)' : ''}, ${valData.appraisal.mostSimilar.sqft.toLocaleString()} sqft (only ${valData.appraisal.mostSimilar.sizeDeltaPct}% size delta) at <strong style="color:#1a1a1a">$${valData.appraisal.mostSimilar.price.toLocaleString()}</strong> ($${valData.appraisal.mostSimilar.ppsf.toLocaleString()}/sqft).
+      <div style="font-size:12px;color:#666;background:#fff;border-radius:5px;padding:9px 11px;line-height:1.5;margin-top:10px">
+        Anchored on <strong style="color:#1a1a1a">${valData.appraisal.mostSimilar.address}</strong>${valData.appraisal.mostSimilar.isAgentIntel ? ' (off-market)' : ''}, ${valData.appraisal.mostSimilar.sqft.toLocaleString()} sqft (${valData.appraisal.mostSimilar.sizeDeltaPct}% size delta from yours) at <strong style="color:#1a1a1a">$${valData.appraisal.mostSimilar.price.toLocaleString()}</strong>.
       </div>` : ''}
-
-      <table style="width:100%;border-collapse:collapse;font-size:12px;border-top:1px solid #e1d9c4;padding-top:8px">
-        <tr><td style="padding:6px 0 0;color:#888">Full comp range (adjusted)</td>
-            <td style="padding:6px 0 0;text-align:right;font-weight:500;color:#888">$${valData.appraisal.low.toLocaleString()} &ndash; $${valData.appraisal.high.toLocaleString()}</td></tr>
-        <tr><td style="padding:3px 0;color:#888">Zillow Zestimate</td>
-            <td style="padding:3px 0;text-align:right;font-weight:500;color:#888">$${val.toLocaleString()}</td></tr>
-      </table>
     </div>` : ''}
-
-    ${(() => {
-      const af = valData.appraiserFacts || {};
-      const facts = [];
-      if (af.view?.length)            facts.push(`<strong>View:</strong> ${af.view.join(', ')}`);
-      if (af.parkingCapacity > 0)     facts.push(`<strong>Parking:</strong> ${af.parkingCapacity} ${af.hasGarage ? 'garage' : 'spaces'}`);
-      if (af.patioAndPorch?.length)   facts.push(`<strong>Outdoor:</strong> ${af.patioAndPorch.join(', ')}`);
-      if (af.numberOfUnitsInCommunity)facts.push(`<strong>Building:</strong> ${af.numberOfUnitsInCommunity} units total`);
-      if (af.yearBuiltEffective && af.yearBuiltEffective !== valData.yearBuilt) facts.push(`<strong>Effective year built:</strong> ${af.yearBuiltEffective} (last major renovation)`);
-      if (af.propertyCondition)       facts.push(`<strong>Condition:</strong> ${af.propertyCondition}`);
-      // Pull mined description features (e.g., "Golden Gate Bridge view, Gardens, High-end finishes")
-      const descFacts = valData.descriptionFeatures || [];
-      if (descFacts.length)           facts.push(`<strong>Highlights from listing:</strong> ${descFacts.join(', ')}`);
-      return facts.length ? `
-      <p style="font-size:12px;color:#666;line-height:1.6;margin:0 0 20px;padding:10px 14px;background:#fafaf8;border-radius:6px">
-        <span style="font-size:11px;font-weight:700;color:#888;text-transform:uppercase;letter-spacing:.06em;display:block;margin-bottom:4px">About your home</span>
-        ${facts.join(' &nbsp;·&nbsp; ')}
-      </p>` : '';
-    })()}
 
     ${(valData.homeAnnualized != null && valData.marketReturn) ? `
     <div style="background:#eef5fa;border:1px solid #d2e2ee;border-radius:8px;padding:14px 16px;margin-bottom:24px">
@@ -591,28 +586,33 @@ function buildEmail(client, valData, senderName) {
       <div style="font-size:10px;color:#8aa3b8;margin-top:8px;line-height:1.4">Source: FRED Case-Shiller San Francisco Home Price Index (SFXRSA), monthly through ${valData.marketReturn.indexDate}. Metro-wide index, may not capture luxury-segment heat.</div>
     </div>` : ''}
 
-    ${valData.zipStats && (valData.zipStats.currentMonth > 0 || valData.zipStats.yearAgoMonth > 0) ? `
-    <div style="background:#f0f4ed;border:1px solid #d1ddc3;border-radius:8px;padding:14px 16px;margin-bottom:20px">
-      <div style="font-size:11px;font-weight:700;color:#3b5a1f;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px">${valData.zipStats.zipcode} sales activity</div>
-      <table style="width:100%;border-collapse:collapse;font-size:13px">
-        <tr><td style="padding:3px 0;color:#666">Homes sold in last 30 days</td>
-            <td style="padding:3px 0;text-align:right;font-weight:700">${valData.zipStats.currentMonth}</td></tr>
-        ${valData.zipStats.yearAgoMonth > 0 ? `
-        <tr><td style="padding:3px 0;color:#666">Same month last year</td>
-            <td style="padding:3px 0;text-align:right;font-weight:600">${valData.zipStats.yearAgoMonth}</td></tr>
-        ${(() => {
-          const delta = valData.zipStats.currentMonth - valData.zipStats.yearAgoMonth;
-          const pct = valData.zipStats.yearAgoMonth ? ((delta / valData.zipStats.yearAgoMonth) * 100) : 0;
-          const color = delta >= 0 ? '#2d7a3a' : '#c0392b';
-          return `<tr><td style="padding:6px 0 0;color:#1a1a1a;font-weight:600;border-top:1px solid #d1ddc3">Year over year</td>
-                  <td style="padding:6px 0 0;text-align:right;font-weight:700;color:${color};border-top:1px solid #d1ddc3">${delta >= 0 ? '+' : ''}${delta} sales (${pct >= 0 ? '+' : ''}${pct.toFixed(0)}%)</td></tr>`;
-        })()}
-        ` : ''}
-        ${valData.zipStats.medianPrice ? `
-        <tr><td style="padding:3px 0;color:#666;font-size:12px">Median sale price this month</td>
-            <td style="padding:3px 0;text-align:right;font-weight:500;font-size:12px">$${valData.zipStats.medianPrice.toLocaleString()}</td></tr>` : ''}
-      </table>
-    </div>` : ''}
+    ${(() => {
+      // Replace generic zip activity with a "similar luxury activity" stat
+      // computed from the actual comp set — so a $23M client sees high-end
+      // sales, not the $1M condo sales that share their zip.
+      const luxComps = (valData.appraisal?.compsUsed || [])
+        .filter(c => c.price && c.sqft)
+        .filter(c => c.sqft >= valData.sqft * 0.5 && c.sqft <= valData.sqft * 1.7)
+        .sort((a, b) => b.price - a.price);
+      if (luxComps.length < 3) return '';
+      const top = luxComps.slice(0, Math.min(8, luxComps.length));
+      const prices = top.map(c => c.price).sort((a, b) => a - b);
+      const med = prices[Math.floor(prices.length / 2)];
+      const high = prices[prices.length - 1];
+      const lo = prices[0];
+      return `
+      <div style="background:#f0f4ed;border:1px solid #d1ddc3;border-radius:8px;padding:14px 16px;margin-bottom:20px">
+        <div style="font-size:11px;font-weight:700;color:#3b5a1f;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px">Similar luxury activity nearby</div>
+        <table style="width:100%;border-collapse:collapse;font-size:13px">
+          <tr><td style="padding:3px 0;color:#666">Recent comparable sales (similar size + class)</td>
+              <td style="padding:3px 0;text-align:right;font-weight:700">${top.length}</td></tr>
+          <tr><td style="padding:3px 0;color:#666">Sale price range</td>
+              <td style="padding:3px 0;text-align:right;font-weight:600">$${(lo/1000000).toFixed(1)}M &ndash; $${(high/1000000).toFixed(1)}M</td></tr>
+          <tr><td style="padding:6px 0 0;color:#1a1a1a;font-weight:600;border-top:1px solid #d1ddc3">Median similar sale</td>
+              <td style="padding:6px 0 0;text-align:right;font-weight:700;border-top:1px solid #d1ddc3">$${med.toLocaleString()}</td></tr>
+        </table>
+      </div>`;
+    })()}
 
     ${(client.manualComps && client.manualComps.length) ? `
     <p style="font-size:13px;font-weight:600;margin:0 0 8px;text-transform:uppercase;letter-spacing:.05em;color:#5a4a1f">Off-market sales I've seen</p>
@@ -636,7 +636,7 @@ function buildEmail(client, valData, senderName) {
     </table>` : ''}
 
     ${compsHtml ? `
-    <p style="font-size:13px;font-weight:600;margin:0 0 8px;text-transform:uppercase;letter-spacing:.05em;color:#888">Comparable properties on your street</p>
+    <p style="font-size:13px;font-weight:600;margin:0 0 8px;text-transform:uppercase;letter-spacing:.05em;color:#888">Top comparable sales in your area</p>
     <table style="width:100%;border-collapse:collapse;margin-bottom:24px;border-top:1px solid #eee">
       ${compsHtml}
     </table>` : ''}
@@ -700,6 +700,36 @@ app.get('/api/status', async (req, res) => {
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
+  }
+});
+
+// Render the email as a standalone HTML page so the user can preview it in a
+// real browser tab (not the cramped dashboard pane). Reuses the previewHtml
+// from the most recent fetch.
+app.get('/api/preview/:id', async (req, res) => {
+  try {
+    const client = await db.getClient(parseInt(req.params.id));
+    if (!client) return res.status(404).send('Client not found');
+    const v = await fetchAndPersist(client);
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    res.send(`<!DOCTYPE html>
+<html><head>
+  <meta charset="utf-8">
+  <title>Email preview — ${client.name}</title>
+  <style>
+    body { margin:0; padding:24px; background:#f5f4f0; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; }
+    .frame { max-width:600px; margin:0 auto; background:#fff; border-radius:8px; padding:32px; box-shadow:0 2px 12px rgba(0,0,0,.06) }
+    .meta { max-width:600px; margin:0 auto 14px; font-size:12px; color:#888 }
+  </style>
+</head><body>
+  <div class="meta">
+    <strong>To:</strong> ${client.email} &nbsp;·&nbsp;
+    <strong>Subject:</strong> Your ${client.addr} home value, ${new Date().toLocaleDateString('en-US',{month:'long',year:'numeric'})}
+  </div>
+  <div class="frame">${v.previewHtml || '(no preview)'}</div>
+</body></html>`);
+  } catch (e) {
+    res.status(500).send('Error: ' + e.message);
   }
 });
 
