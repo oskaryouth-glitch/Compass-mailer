@@ -111,14 +111,22 @@
       </div>
       <div id="sender-info" style="font-size:11px;color:#888;margin-bottom:12px"></div>
 
+      <div style="background:#fdfaf0;border:1px solid #e1d9c4;border-radius:6px;padding:8px;margin-bottom:8px">
+        <div style="font-size:11px;color:#5a4a1f;font-weight:700;margin-bottom:6px">📋 Paste from SFAR / Rapattoni MLS</div>
+        <textarea id="paste-text" placeholder="Paste the full SFAR search results table here. Auto-routes to clients by property type + sqft." style="width:100%;min-height:80px;font-size:10px;font-family:monospace;padding:6px;border:1px solid #ddd;border-radius:5px;margin-bottom:6px"></textarea>
+        <label style="display:block;font-size:11px;color:#666;margin-bottom:6px">
+          <input type="checkbox" id="paste-replace" style="vertical-align:middle" /> Replace existing comps (else: append)
+        </label>
+        <button onclick="importPaste()" id="paste-btn" class="save-btn" style="width:100%">Parse & import</button>
+      </div>
+
       <div style="background:#fdfaf0;border:1px solid #e1d9c4;border-radius:6px;padding:8px">
-        <div style="font-size:11px;color:#5a4a1f;font-weight:700;margin-bottom:6px">📥 Bulk import SFAR / MLS CSV</div>
+        <div style="font-size:11px;color:#5a4a1f;font-weight:700;margin-bottom:6px">📥 Or upload a CSV</div>
         <input type="file" id="csv-file" accept=".csv" style="font-size:11px;width:100%;margin-bottom:6px" />
         <label style="display:block;font-size:11px;color:#666;margin-bottom:6px">
-          <input type="checkbox" id="csv-replace" style="vertical-align:middle" /> Replace existing comps (else: append)
+          <input type="checkbox" id="csv-replace" style="vertical-align:middle" /> Replace existing comps
         </label>
-        <button onclick="importCsv()" id="csv-btn" class="save-btn" style="width:100%">Import</button>
-        <div style="font-size:10px;color:#aaa;margin-top:4px;line-height:1.4">Auto-routes rows to clients by zip + sqft. Expects SFAR/Rapattoni-style headers.</div>
+        <button onclick="importCsv()" id="csv-btn" class="save-btn" style="width:100%">Import CSV</button>
       </div>
     </div>
     <div class="stats">
@@ -412,6 +420,45 @@ async function saveManualComps(comps) {
     } catch (e) { /* silent — comp still saved */ }
   }
   return true;
+}
+
+async function importPaste() {
+  const text = document.getElementById('paste-text').value.trim();
+  if (!text || text.length < 100) { toast('Paste the MLS table content first'); return; }
+  const replace = document.getElementById('paste-replace').checked;
+  const btn = document.getElementById('paste-btn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Parsing…';
+  try {
+    const r = await fetch('/api/import-paste', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, replace }),
+    });
+    const d = await r.json();
+    if (d.error) { toast('Error: ' + d.error); return; }
+    let summary = `Parsed ${d.totalParsed} listings.\n`;
+    summary += `\nBy district: ` + Object.entries(d.byDistrict).map(([k,v]) => `${k}=${v}`).join(', ');
+    summary += `\nBy type: ` + Object.entries(d.byType).map(([k,v]) => `${k}=${v}`).join(', ');
+    summary += '\n';
+    Object.values(d.perClient).forEach(p => {
+      summary += `\n${p.name}: ${p.candidates} candidate comps → ${p.added} added → ${p.totalNow} total`;
+    });
+    alert(summary);
+    document.getElementById('paste-text').value = '';
+    await loadStatus();
+    const c = clients[selected];
+    if (c && liveVals[c.id]) {
+      const r2 = await fetch(`/api/estimate/${c.id}`, { method: 'POST' });
+      const d2 = await r2.json();
+      if (!d2.error) { liveVals[c.id] = d2; renderSelected(); }
+    }
+  } catch (e) {
+    toast('Error: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = 'Parse & import';
+  }
 }
 
 async function importCsv() {

@@ -959,6 +959,121 @@ app.post('/api/import-csv', async (req, res) => {
   }
 });
 
+// Parse pasted text from Rapattoni MLS / SFAR.
+// Each listing is a block of ~17 fields on consecutive lines (one field per
+// line), often prefixed by icon labels like "location_city" or "store" and
+// followed by icon labels like "history attach_money map ...".
+// We detect each block by the leading listing-number line.
+function parseRapattoniText(text) {
+  const lines = text.split(/\r?\n/).map(l => l.trim());
+  const isIconLine = s => /^(history|attach_money|attach_file|map|photo_library|theaters|location_city|store|edit|settings|help)$/.test(s);
+  const out = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    if (!/^\d{7,9}$/.test(lines[i])) continue;
+    const listing = lines[i];
+    let j = i + 1;
+    // Skip optional icon-label prefix lines
+    while (j < lines.length && isIconLine(lines[j])) j++;
+    // Now grab the next 17 non-empty fields, skipping any icon lines mixed in
+    const fields = [];
+    while (fields.length < 17 && j < lines.length) {
+      const l = lines[j++];
+      if (l && !isIconLine(l)) fields.push(l);
+    }
+    if (fields.length < 16) continue;
+    const [address, bd, ba, sqftRaw, priceRaw, type, subtype, status, dateStr, dom, city, area, subdistrict, unitsRaw, origin, parking] = fields;
+    const price = parseInt(priceRaw.replace(/[^0-9]/g, ''), 10);
+    if (!price || !address) continue;
+    const sqft = sqftRaw ? parseInt(sqftRaw.replace(/[,]/g, ''), 10) || null : null;
+    const beds = parseInt(bd, 10) || null;
+    const baMatch = ba.match(/^(\d+(?:\.\d+)?)/);
+    const baths = baMatch ? parseFloat(baMatch[1]) : null;
+    let soldDate = null;
+    const dm = dateStr.match(/(\d{1,2})\/(\d{1,2})\/(\d{2})/);
+    if (dm) soldDate = `20${dm[3]}-${dm[1].padStart(2,'0')}-${dm[2].padStart(2,'0')}`;
+    out.push({
+      listing, address, beds, baths, sqft, price, type, subtype, status,
+      soldDate, dom: parseInt(dom,10)||null, city, area, subdistrict,
+      units: parseInt(unitsRaw, 10) || null,
+      mlsOrigin: origin,
+    });
+  }
+  return out;
+}
+
+app.post('/api/import-paste', async (req, res) => {
+  try {
+    const text = req.body.text || '';
+    if (!text || text.length < 100) return res.status(400).json({ error: 'No text content provided' });
+
+    const parsed = parseRapattoniText(text);
+    if (!parsed.length) return res.status(400).json({ error: 'No valid listings detected. Expected Rapattoni / SFAR paste format.' });
+
+    const replace = req.body.replace === true;
+    const clients = await db.listClients();
+    const perClient = {};
+
+    for (const c of clients) {
+      // Decide subject property class from the client's known sqft / structure
+      const subjectSqft = c.sqft || 0;
+      const wantHouse = subjectSqft > 2500; // heuristic
+      const wantTypes = wantHouse ? ['HSL1'] : ['CNDO','TCLA','COOP'];
+
+      const matches = parsed
+        .filter(comp => wantTypes.includes(comp.type))
+        .filter(comp => comp.sqft && (!subjectSqft ||
+          (comp.sqft >= subjectSqft * 0.5 && comp.sqft <= subjectSqft * 2.0)))
+        .sort((a,b) => {
+          if (!subjectSqft) return 0;
+          return Math.abs(a.sqft - subjectSqft) - Math.abs(b.sqft - subjectSqft);
+        })
+        .slice(0, 10);
+
+      // Build the manual-comp shape
+      const newComps = matches.map(comp => {
+        const ppsf = comp.sqft ? Math.round(comp.price / comp.sqft) : null;
+        const labelStatus = comp.status === 'Sold Off MLS' ? 'SOLD OFF MLS via SFAR' : 'SFAR Closed';
+        const noteBits = [labelStatus, comp.subdistrict];
+        if (comp.units) noteBits.push(`${comp.units} units`);
+        if (ppsf) noteBits.push(`$${ppsf.toLocaleString()}/sqft`);
+        return {
+          address: `${comp.address}, ${comp.city}, CA`,
+          price: comp.price,
+          beds: comp.beds,
+          baths: comp.baths,
+          sqft: comp.sqft,
+          soldDate: comp.soldDate,
+          note: noteBits.filter(Boolean).join('. '),
+        };
+      });
+
+      const existing = replace ? [] : (c.manualComps || []);
+      const seen = new Set(existing.map(e => (e.address||'').toLowerCase()));
+      const additions = newComps.filter(comp => !seen.has(comp.address.toLowerCase()));
+      const combined = [...existing, ...additions].slice(0, 10);
+
+      if (additions.length || replace) await db.setManualComps(c.id, combined);
+      perClient[c.id] = {
+        name: c.name,
+        candidates: matches.length,
+        added: additions.length,
+        totalNow: combined.length,
+      };
+    }
+
+    res.json({
+      ok: true,
+      totalParsed: parsed.length,
+      byDistrict: parsed.reduce((acc, c) => { acc[c.area] = (acc[c.area]||0)+1; return acc; }, {}),
+      byType: parsed.reduce((acc, c) => { acc[c.type] = (acc[c.type]||0)+1; return acc; }, {}),
+      perClient,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Quick-add a manual comp by address or Zillow URL. We call the
 // zillow-detail-scraper to look it up, then auto-append as a manual comp.
 // Solves: Max sees a $50M sale on Zillow → one paste → it lands in the client's
