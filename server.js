@@ -384,8 +384,9 @@ async function fetchAndPersist(client) {
         sqft:       mc.sqft,
         beds:       mc.beds,
         baths:      mc.baths,
+        dom:        mc.dom ?? null,
         homeStatus: 'AGENT_INTEL',
-        homeType:   v.homeType, // assume same as subject — Max wouldn't add unrelated comps
+        homeType:   v.homeType,
       })),
     ];
     const reAppraisal = computeAppraisalEstimate(subjectForAppraisal, combinedComps);
@@ -518,30 +519,65 @@ function buildEmail(client, valData, senderName) {
       </td>
     </tr>`).join('');
 
-  // Purchase-gain block: only if we know what they paid
-  const sqft     = client.sqft || valData.sqft;
-  const gain     = gainSincePurchase;
-  const gainPct  = purchase ? ((val - purchase) / purchase) * 100 : null;
-  const ppsf     = sqft ? Math.round(val / sqft) : null;
-  const purchaseHtml = purchase ? `
-    <table style="width:100%;border-collapse:collapse;margin-bottom:24px;font-size:13px">
-      <tr><td style="padding:4px 0;color:#888">Purchased${purchaseDate ? ' ' + new Date(purchaseDate).toLocaleDateString('en-US',{month:'short',year:'numeric'}) : ''}</td>
-          <td style="padding:4px 0;text-align:right;font-weight:600">$${purchase.toLocaleString()}</td></tr>
-      ${gain != null ? `
-      <tr><td style="padding:4px 0;color:#888">Gain since purchase</td>
-          <td style="padding:4px 0;text-align:right;font-weight:700;color:${gain >= 0 ? '#2d7a3a' : '#c0392b'}">
-            ${gain >= 0 ? '+' : '−'}$${Math.abs(gain).toLocaleString()}${gainPct != null ? ` (${gainPct >= 0 ? '+' : ''}${gainPct.toFixed(1)}%)` : ''}
-          </td></tr>` : ''}
-      ${valData.monthlyAppreciation != null ? `
-      <tr><td style="padding:4px 0;color:#888">Average per month</td>
-          <td style="padding:4px 0;text-align:right;font-weight:600;color:${valData.monthlyAppreciation >= 0 ? '#2d7a3a' : '#c0392b'}">
-            ≈ ${valData.monthlyAppreciation >= 0 ? '+' : '−'}$${Math.abs(valData.monthlyAppreciation).toLocaleString()}/mo
-            <span style="font-weight:400;color:#aaa">over ${valData.monthsHeld} mo</span>
-          </td></tr>` : ''}
-      ${ppsf ? `
-      <tr><td style="padding:4px 0;color:#888">Price per sqft</td>
-          <td style="padding:4px 0;text-align:right;font-weight:600">$${ppsf.toLocaleString()}</td></tr>` : ''}
-    </table>` : '';
+  // "Your story so far" — narrative timeline format. Replaces the dense table.
+  const sqft    = client.sqft || valData.sqft;
+  const gain    = gainSincePurchase;
+  const gainPct = purchase ? ((val - purchase) / purchase) * 100 : null;
+  const ppsf    = sqft ? Math.round(val / sqft) : null;
+  const purchaseMonthYear = purchaseDate
+    ? new Date(purchaseDate).toLocaleDateString('en-US',{month:'long',year:'numeric'})
+    : null;
+  // Format months held as years + months
+  const yearsHeld = valData.monthsHeld ? Math.floor(valData.monthsHeld / 12) : null;
+  const remainderMonths = valData.monthsHeld ? valData.monthsHeld % 12 : null;
+  const durationStr = yearsHeld != null
+    ? (yearsHeld > 0
+        ? `${yearsHeld} year${yearsHeld === 1 ? '' : 's'}${remainderMonths ? ` and ${remainderMonths} month${remainderMonths === 1 ? '' : 's'}` : ''}`
+        : `${remainderMonths} month${remainderMonths === 1 ? '' : 's'}`)
+    : null;
+  const purchaseHtml = (purchase && purchaseDate) ? `
+    <div style="background:#fff;border:1px solid #e8e6e0;border-radius:8px;padding:18px 20px;margin-bottom:24px">
+      <div style="font-size:11px;font-weight:700;color:#888;text-transform:uppercase;letter-spacing:.06em;margin-bottom:12px">Your story so far</div>
+
+      <div style="display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:6px">
+        <div>
+          <div style="font-size:11px;color:#888;margin-bottom:2px">${purchaseMonthYear}</div>
+          <div style="font-size:17px;font-weight:700;color:#1a1a1a">$${purchase.toLocaleString()}</div>
+          <div style="font-size:11px;color:#888;margin-top:2px">Purchase price</div>
+        </div>
+        <div style="text-align:right">
+          <div style="font-size:11px;color:#888;margin-bottom:2px">Today</div>
+          <div style="font-size:17px;font-weight:700;color:#1a1a1a">$${val.toLocaleString()}</div>
+          <div style="font-size:11px;color:#888;margin-top:2px">Compass estimate</div>
+        </div>
+      </div>
+
+      <div style="height:6px;background:linear-gradient(90deg,#e8e6e0,${gain >= 0 ? '#2d7a3a' : '#c0392b'});border-radius:3px;margin:14px 0 8px"></div>
+      <div style="text-align:center;font-size:11px;color:#888;margin-bottom:18px">
+        ${durationStr ? `Over ${durationStr}` : 'Since purchase'}
+      </div>
+
+      <table style="width:100%;border-collapse:collapse;font-size:13px">
+        ${gain != null ? `
+        <tr><td style="padding:4px 0;color:#666">Equity added to your home</td>
+            <td style="padding:4px 0;text-align:right;font-weight:700;color:${gain >= 0 ? '#2d7a3a' : '#c0392b'};font-size:14px">
+              ${gain >= 0 ? '+' : '−'}$${Math.abs(gain).toLocaleString()}${gainPct != null ? `<span style="font-weight:500;color:#888;font-size:12px"> &nbsp;(${gainPct >= 0 ? '+' : ''}${gainPct.toFixed(1)}%)</span>` : ''}
+            </td></tr>` : ''}
+        ${valData.monthlyAppreciation != null ? `
+        <tr><td style="padding:4px 0;color:#666">Average per month</td>
+            <td style="padding:4px 0;text-align:right;font-weight:600;color:${valData.monthlyAppreciation >= 0 ? '#2d7a3a' : '#c0392b'}">
+              ≈ ${valData.monthlyAppreciation >= 0 ? '+' : '−'}$${Math.abs(valData.monthlyAppreciation).toLocaleString()}/mo
+            </td></tr>` : ''}
+        ${valData.homeAnnualized != null ? `
+        <tr><td style="padding:4px 0;color:#666">Annualized return</td>
+            <td style="padding:4px 0;text-align:right;font-weight:600;color:${valData.homeAnnualized >= 0 ? '#2d7a3a' : '#c0392b'}">
+              ${valData.homeAnnualized >= 0 ? '+' : '−'}${Math.abs(valData.homeAnnualized * 100).toFixed(1)}%/yr
+            </td></tr>` : ''}
+        ${ppsf ? `
+        <tr><td style="padding:4px 0;color:#666">Current value per sqft</td>
+            <td style="padding:4px 0;text-align:right;font-weight:600">$${ppsf.toLocaleString()}/sf</td></tr>` : ''}
+      </table>
+    </div>` : '';
 
   const html = `
   <div style="font-family:Georgia,serif;max-width:520px;margin:0 auto;color:#1a1a1a">
@@ -590,9 +626,9 @@ function buildEmail(client, valData, senderName) {
     </div>` : ''}
 
     ${(() => {
-      // Replace generic zip activity with a "similar luxury activity" stat
-      // computed from the actual comp set — so a $23M client sees high-end
-      // sales, not the $1M condo sales that share their zip.
+      // Similar luxury activity computed from the actual comp set so a $23M
+      // client sees high-end sales, not the $1M condo sales sharing their zip.
+      // Includes DOM-based market-heat signal.
       const luxComps = (valData.appraisal?.compsUsed || [])
         .filter(c => c.price && c.sqft)
         .filter(c => c.sqft >= valData.sqft * 0.5 && c.sqft <= valData.sqft * 1.7)
@@ -603,17 +639,43 @@ function buildEmail(client, valData, senderName) {
       const med = prices[Math.floor(prices.length / 2)];
       const high = prices[prices.length - 1];
       const lo = prices[0];
+
+      // DOM analytics — only counts comps that have a DOM value
+      const withDom = top.filter(c => c.dom != null);
+      let domLine = '';
+      let heatLine = '';
+      if (withDom.length >= 2) {
+        const avgDom = Math.round(withDom.reduce((s, c) => s + c.dom, 0) / withDom.length);
+        const under30 = withDom.filter(c => c.dom < 30).length;
+        const under14 = withDom.filter(c => c.dom < 14).length;
+        let heat, heatColor;
+        if (avgDom < 14)       { heat = 'very competitive market — bidding war territory';     heatColor = '#c0392b'; }
+        else if (avgDom < 30)  { heat = 'hot market with strong buyer demand';                  heatColor = '#c0392b'; }
+        else if (avgDom < 60)  { heat = 'active market, balanced between buyers and sellers';   heatColor = '#7a5018'; }
+        else                   { heat = 'softer market — homes taking longer to sell';          heatColor = '#3b5a1f'; }
+        domLine = `
+          <tr><td style="padding:3px 0;color:#666">Average days on market</td>
+              <td style="padding:3px 0;text-align:right;font-weight:700">${avgDom} days</td></tr>
+          <tr><td style="padding:3px 0;color:#666">Sold in under 30 days</td>
+              <td style="padding:3px 0;text-align:right;font-weight:600">${under30} of ${withDom.length}${under14 ? ` (${under14} in under 2 weeks)` : ''}</td></tr>`;
+        heatLine = `
+          <div style="font-size:12px;color:${heatColor};margin-top:10px;padding-top:8px;border-top:1px solid #d1ddc3;line-height:1.5">
+            <strong>Read:</strong> ${heat}.
+          </div>`;
+      }
       return `
       <div style="background:#f0f4ed;border:1px solid #d1ddc3;border-radius:8px;padding:14px 16px;margin-bottom:20px">
         <div style="font-size:11px;font-weight:700;color:#3b5a1f;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px">Similar luxury activity nearby</div>
         <table style="width:100%;border-collapse:collapse;font-size:13px">
-          <tr><td style="padding:3px 0;color:#666">Recent comparable sales (similar size + class)</td>
+          <tr><td style="padding:3px 0;color:#666">Recent comparable sales</td>
               <td style="padding:3px 0;text-align:right;font-weight:700">${top.length}</td></tr>
           <tr><td style="padding:3px 0;color:#666">Sale price range</td>
               <td style="padding:3px 0;text-align:right;font-weight:600">$${(lo/1000000).toFixed(1)}M &ndash; $${(high/1000000).toFixed(1)}M</td></tr>
-          <tr><td style="padding:6px 0 0;color:#1a1a1a;font-weight:600;border-top:1px solid #d1ddc3">Median similar sale</td>
-              <td style="padding:6px 0 0;text-align:right;font-weight:700;border-top:1px solid #d1ddc3">$${med.toLocaleString()}</td></tr>
+          <tr><td style="padding:3px 0;color:#666">Median sale price</td>
+              <td style="padding:3px 0;text-align:right;font-weight:600">$${med.toLocaleString()}</td></tr>
+          ${domLine}
         </table>
+        ${heatLine}
       </div>`;
     })()}
 
@@ -1076,6 +1138,7 @@ app.post('/api/import-paste', async (req, res) => {
           beds: comp.beds,
           baths: comp.baths,
           sqft: comp.sqft,
+          dom: comp.dom,
           soldDate: comp.soldDate,
           note: noteBits.filter(Boolean).join('. '),
         };
@@ -1193,6 +1256,7 @@ app.put('/api/clients/:id/manual-comps', async (req, res) => {
         beds:     c.beds  != null ? Number(c.beds)  : null,
         baths:    c.baths != null ? Number(c.baths) : null,
         sqft:     c.sqft  != null ? Number(c.sqft)  : null,
+        dom:      c.dom   != null ? Number(c.dom)   : null,
         soldDate: c.soldDate || null,
         note:     c.note ? String(c.note).trim().slice(0, 200) : null,
       }))
