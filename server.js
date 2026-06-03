@@ -180,12 +180,18 @@ function normalizeNearbyHome(n) {
 }
 
 // Pick the best comparables for sales-comparison valuation:
-// (a) same home type, (b) sqft within 50%-150% of subject, (c) prefer same
-// street/building, then closest by geo distance.
+// (a) actually SOLD (drop OTHER off-market with Zestimates, drop FOR_SALE
+//     listings — Max's rule: "money in the bank or it doesn't count"),
+// (b) same home type, (c) sqft within 50%-150% of subject,
+// (d) prefer same street/building, then closest by geo distance.
 function pickComparables(nearbyHomes, subject) {
   if (!Array.isArray(nearbyHomes) || !nearbyHomes.length) return [];
 
-  const comps = nearbyHomes.map(normalizeNearbyHome).filter(c => c.address && c.price && c.sqft > 0);
+  const isSold = s => s === 'SOLD' || s === 'RECENTLY_SOLD' || s === 'SOLD_OFF_MARKET';
+  const comps = nearbyHomes
+    .map(normalizeNearbyHome)
+    .filter(c => c.address && c.price && c.sqft > 0)
+    .filter(c => isSold(c.homeStatus));
   const subType  = subject.homeType;
   const subSqft  = subject.sqft;
   const subLat   = subject.lat;
@@ -409,18 +415,37 @@ async function fetchAndPersist(client) {
     const subjectForAppraisal = {
       sqft: v.sqft, beds: v.beds, baths: v.baths,
     };
+    // Sold-only rule: drop manual comps with status 'asking'. They're listed
+    // but the money hasn't changed hands. Anything without an explicit status
+    // gets inferred — soldDate present => sold, otherwise asking (filtered out).
+    const soldManualComps = mergedClient.manualComps.filter(mc => {
+      if (mc.status === 'asking') return false;
+      if (mc.status === 'sold_mls' || mc.status === 'sold_off_mls') return true;
+      // No explicit status: include only if we have a soldDate
+      return !!mc.soldDate;
+    });
     const combinedComps = [
       ...(v.comparables || []),
-      ...mergedClient.manualComps.map(mc => ({
-        address:    mc.address,
-        price:      mc.price,
-        sqft:       mc.sqft,
-        beds:       mc.beds,
-        baths:      mc.baths,
-        dom:        mc.dom ?? null,
-        homeStatus: 'AGENT_INTEL',
-        homeType:   v.homeType,
-      })),
+      ...soldManualComps.map(mc => {
+        const statusMap = {
+          sold_mls:     'SOLD',
+          sold_off_mls: 'SOLD_OFF_MARKET',
+        };
+        const homeStatus = statusMap[mc.status]
+          || (mc.soldDate ? 'SOLD_OFF_MARKET' : 'SOLD');
+        return {
+          address:    mc.address,
+          price:      mc.price,
+          sqft:       mc.sqft,
+          beds:       mc.beds,
+          baths:      mc.baths,
+          dom:        mc.dom ?? null,
+          soldDate:   mc.soldDate ?? null,
+          homeStatus,
+          homeType:   v.homeType,
+          isAgentIntel: true,
+        };
+      }),
     ];
     const reAppraisal = computeAppraisalEstimate(subjectForAppraisal, combinedComps);
     if (reAppraisal) v.appraisal = reAppraisal;
@@ -519,15 +544,17 @@ function buildEmail(client, valData, senderName) {
   const market    = marketName(client.city);
 
   function statusLabel(s) {
-    if (s === 'FOR_SALE')      return 'For sale';
-    if (s === 'SOLD')          return 'Recently sold';
-    if (s === 'PENDING')       return 'Pending';
-    return 'Off market'; // OTHER or unknown
+    if (s === 'FOR_SALE')        return 'On market';
+    if (s === 'SOLD')            return 'Recently sold';
+    if (s === 'SOLD_OFF_MARKET') return 'Sold off-market';
+    if (s === 'PENDING')         return 'Pending';
+    return 'Off market';
   }
   function statusColor(s) {
-    if (s === 'FOR_SALE')      return '#1a4a7a';
-    if (s === 'SOLD')          return '#5a4a1f';
-    if (s === 'PENDING')       return '#7a5018';
+    if (s === 'FOR_SALE')        return '#1a4a7a';
+    if (s === 'SOLD')            return '#666';
+    if (s === 'SOLD_OFF_MARKET') return '#5a4a1f';
+    if (s === 'PENDING')         return '#7a5018';
     return '#999';
   }
   // Prefer the appraisal's "top comps by price" so we show the impressive ones
@@ -712,26 +739,39 @@ function buildEmail(client, valData, senderName) {
       </div>`;
     })()}
 
-    ${(client.manualComps && client.manualComps.length) ? `
-    <p style="font-size:13px;font-weight:600;margin:0 0 8px;text-transform:uppercase;letter-spacing:.05em;color:#5a4a1f">Off-market sales I've seen</p>
-    <div style="font-size:11px;color:#888;margin-bottom:8px;font-style:italic">From my private intel, not on Zillow or the public MLS:</div>
-    <table style="width:100%;border-collapse:collapse;margin-bottom:24px;border-top:1px solid #e1d9c4;background:#fdfaf0">
-      ${client.manualComps.map(c => `
-      <tr style="border-bottom:1px solid #f0e9d4">
-        <td style="padding:8px 6px;font-size:13px">
-          <div style="font-weight:600;color:#1a1a1a">${c.address}</div>
-          <div style="font-size:11px;color:#888;margin-top:1px">
-            ${c.beds != null ? c.beds + 'bd · ' : ''}${c.baths != null ? c.baths + 'ba · ' : ''}${c.sqft ? c.sqft.toLocaleString() + ' sf' : ''}
-            ${c.soldDate ? ' &nbsp;·&nbsp; sold ' + new Date(c.soldDate).toLocaleDateString('en-US',{month:'short',year:'numeric'}) : ''}
-          </div>
-          ${c.note ? `<div style="font-size:11px;color:#5a4a1f;margin-top:2px;font-style:italic">${c.note}</div>` : ''}
-        </td>
-        <td style="padding:8px 6px;text-align:right;font-weight:700;font-size:13px;vertical-align:top">
-          $${Math.round(c.price).toLocaleString()}
-          ${c.sqft ? `<div style="font-size:10px;color:#aaa;font-weight:400;margin-top:1px">$${Math.round(c.price/c.sqft).toLocaleString()}/sf</div>` : ''}
-        </td>
-      </tr>`).join('')}
-    </table>` : ''}
+    ${(() => {
+      // Only show SOLD manual comps. Listed-but-not-sold comps don't count.
+      const sold = (client.manualComps || []).filter(c =>
+        c.status === 'sold_mls' || c.status === 'sold_off_mls' || (!c.status && c.soldDate)
+      );
+      if (!sold.length) return '';
+      const hasOffMarket = sold.some(c => c.status === 'sold_off_mls');
+      const label = hasOffMarket ? 'Sold comps I\'m tracking (incl. off-market)' : 'Sold comps I\'m tracking';
+      return `
+      <p style="font-size:13px;font-weight:600;margin:0 0 8px;text-transform:uppercase;letter-spacing:.05em;color:#5a4a1f">${label}</p>
+      <table style="width:100%;border-collapse:collapse;margin-bottom:24px;border-top:1px solid #e1d9c4;background:#fdfaf0">
+        ${sold.map(c => {
+          const offMkt = c.status === 'sold_off_mls';
+          const tag = offMkt ? '<span style="color:#5a4a1f;font-weight:700">Off-market</span>' : '<span style="color:#666">Sold</span>';
+          const dateStr = c.soldDate ? new Date(c.soldDate).toLocaleDateString('en-US',{month:'short',year:'numeric'}) : null;
+          return `
+        <tr style="border-bottom:1px solid #f0e9d4">
+          <td style="padding:8px 6px;font-size:13px">
+            <div style="font-weight:600;color:#1a1a1a">${c.address}</div>
+            <div style="font-size:11px;color:#888;margin-top:1px">
+              ${c.beds != null ? c.beds + 'bd · ' : ''}${c.baths != null ? c.baths + 'ba · ' : ''}${c.sqft ? c.sqft.toLocaleString() + ' sf' : ''}
+              &nbsp;·&nbsp; ${tag}${dateStr ? ' ' + dateStr : ''}
+            </div>
+            ${c.note ? `<div style="font-size:11px;color:#5a4a1f;margin-top:2px;font-style:italic">${c.note}</div>` : ''}
+          </td>
+          <td style="padding:8px 6px;text-align:right;font-weight:700;font-size:13px;vertical-align:top">
+            $${Math.round(c.price).toLocaleString()}
+            ${c.sqft ? `<div style="font-size:10px;color:#aaa;font-weight:400;margin-top:1px">$${Math.round(c.price/c.sqft).toLocaleString()}/sf</div>` : ''}
+          </td>
+        </tr>`;
+        }).join('')}
+      </table>`;
+    })()}
 
     ${compsHtml ? `
     <p style="font-size:13px;font-weight:600;margin:0 0 8px;text-transform:uppercase;letter-spacing:.05em;color:#888">Top comparable sales in your area</p>
@@ -1281,6 +1321,7 @@ app.put('/api/clients/:id/manual-comps', async (req, res) => {
     const id = parseInt(req.params.id);
     const incoming = Array.isArray(req.body.comps) ? req.body.comps : [];
     // Light validation: each must have at minimum an address and a price
+    const allowedStatuses = ['asking', 'sold_mls', 'sold_off_mls'];
     const cleaned = incoming
       .filter(c => c && c.address && c.price)
       .map(c => ({
@@ -1291,6 +1332,8 @@ app.put('/api/clients/:id/manual-comps', async (req, res) => {
         sqft:     c.sqft  != null ? Number(c.sqft)  : null,
         dom:      c.dom   != null ? Number(c.dom)   : null,
         soldDate: c.soldDate || null,
+        // Status defaults: explicit value > soldDate-implies-sold > asking
+        status:   allowedStatuses.includes(c.status) ? c.status : (c.soldDate ? 'sold_mls' : 'asking'),
         note:     c.note ? String(c.note).trim().slice(0, 200) : null,
       }))
       .slice(0, 10); // cap at 10 per client
